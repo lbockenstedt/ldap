@@ -1,4 +1,5 @@
 #!/bin/bash
+<<<<<<< HEAD
 set -e
 
 # ------------------------------------------------------------------
@@ -87,3 +88,73 @@ systemctl enable lm-ldap
 systemctl restart lm-ldap
 
 echo "🎉 LDAP Spoke installation complete!"
+=======
+
+# LDAP Installation and Configuration Script
+# Target OS: Ubuntu / Debian
+
+set -e
+
+# --- CONFIGURATION VARIABLES ---
+# Change these values to match your environment
+LDAP_DOMAIN="example.com"          # e.g., "company.local" or "ldap.example.com"
+LDAP_ORG="Example Organization"    # Your organization name
+LDAP_ADMIN_PASSWORD="adminpassword" # Password for the LDAP admin account
+# -------------------------------
+
+echo "Starting LDAP installation and configuration..."
+
+# 1. Check for root privileges
+if [[ $EUID -ne 0 ]]; then
+   echo "This script must be run as root (use sudo)"
+   exit 1
+fi
+
+# Convert domain to DN format (e.g., example.com -> dc=example,dc=com)
+DN_SUFFIX=$(echo $LDAP_DOMAIN | sed 's/\./,dc=/g' | sed 's/^/dc=/')
+
+echo "Configuring for Domain: $LDAP_DOMAIN (Suffix: $DN_SUFFIX)"
+echo "Organization: $LDAP_ORG"
+
+# 2. Pre-seed debconf to make slapd installation non-interactive
+echo "Pre-seeding configuration..."
+debconf-set-selections <<< "slapd slapd/ldap_domain $LDAP_DOMAIN"
+debconf-set-selections <<< "slapd slapd/ldap_organization $LDAP_ORG"
+debconf-set-selections <<< "slapd slapd/ldap_admin_password password $LDAP_ADMIN_PASSWORD"
+debconf-set-selections <<< "slapd slapd/ldap_config a la slapd"
+
+# 3. Install slapd and ldap-utils
+echo "Installing packages..."
+apt-get update
+apt-get install -y slapd ldap-utils
+
+# 4. Configure the LDAP server (force reconfiguration to apply debconf)
+echo "Applying configuration..."
+dpkg-reconfigure -f noninteractive slapd
+
+# 5. Populate base structure from LDIF
+if [ -f "base_structure.ldif" ]; then
+    echo "Populating base directory structure..."
+
+    # Create a temporary LDIF file with replaced domain placeholders
+    TEMP_LDIF=$(mktemp)
+    sed "s/dc=EXAMPLE,dc=COM/$DN_SUFFIX/g" base_structure.ldif > "$TEMP_LDIF"
+
+    # Import the structure using the admin password
+    ldapadd -x -D "cn=admin,${DN_SUFFIX}" -w "$LDAP_ADMIN_PASSWORD" -f "$TEMP_LDIF"
+
+    rm "$TEMP_LDIF"
+    echo "Base structure imported successfully."
+else
+    echo "Warning: base_structure.ldif not found. Skipping population step."
+fi
+
+echo "--------------------------------------------------"
+echo "LDAP installation complete!"
+echo "Domain: $LDAP_DOMAIN"
+echo "Admin DN: cn=admin,${DN_SUFFIX}"
+echo "Admin Password: $LDAP_ADMIN_PASSWORD"
+echo "--------------------------------------------------"
+echo "To verify the installation, run:"
+echo "ldapsearch -x -b \"${DN_SUFFIX}\" -H ldap://localhost"
+>>>>>>> 1b24d1f (Update LDAP module and configuration)

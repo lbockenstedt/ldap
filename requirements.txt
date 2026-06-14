@@ -1,5 +1,12 @@
+<<<<<<< HEAD
 flask
 python-ldap
 python-dotenv
 websockets
 requests
+=======
+ldap3
+websockets
+fastapi
+uvicorn
+>>>>>>> 1b24d1f (Update LDAP module and configuration)

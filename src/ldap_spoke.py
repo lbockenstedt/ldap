@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 import asyncio
 import logging
 from typing import Any, Dict
@@ -7,11 +8,18 @@ except ImportError:
     from core.src.base_spoke import BaseSpoke
 
 from .ldap_manager import LdapManager
+=======
+import logging
+from typing import Dict, Any
+from lm.hub.src.base_spoke import BaseSpoke
+from .ldap_engine import LdapEngine
+>>>>>>> 1b24d1f (Update LDAP module and configuration)
 
 logger = logging.getLogger("LdapSpoke")
 
 class LdapSpoke(BaseSpoke):
     """
+<<<<<<< HEAD
     LDAP integration spoke. Hosts the LDAP server and provides a management API.
     """
     def __init__(self, spoke_id: str, config: Dict[str, Any], control_plane=None):
@@ -25,11 +33,29 @@ class LdapSpoke(BaseSpoke):
 
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
         # Normalize command type to uppercase for case-insensitive matching
+=======
+    LDAP Identity Management Spoke for Lab Manager.
+    Translates Hub commands into LDAP directory operations.
+    """
+    def __init__(self, spoke_id: str, config: Dict[str, Any]):
+        super().__init__(spoke_id, config)
+        # Initialize Engine using config credentials
+        self.engine = LdapEngine(
+            url=config.get("ldap_url", "ldap://localhost"),
+            bind_dn=config.get("bind_dn", "cn=admin,dc=lab,dc=local"),
+            password=config.get("bind_password")
+        )
+
+    async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        logger.info(f"Handling Ldap Command: {command_type} with data {data}")
+
+>>>>>>> 1b24d1f (Update LDAP module and configuration)
         normalized_cmd = command_type.upper()
 
         if normalized_cmd == "GET_VERSION":
             return {"status": "SUCCESS", "version": self.get_version()}
 
+<<<<<<< HEAD
         if normalized_cmd == "UPDATE_CONFIG":
             logger.info(f"Updating LDAP configuration: {data}")
             self.config = data
@@ -91,4 +117,38 @@ class LdapSpoke(BaseSpoke):
 
     def get_version(self) -> str:
         """Returns the current version of the LDAP module."""
+=======
+        if command_type == "LDAP_ADD_USER":
+            # Data expected: {"username": "jdoe", "first_name": "John", "last_name": "Doe"}
+            return self.engine.add_user(
+                data.get("username"),
+                data.get("first_name"),
+                data.get("last_name")
+            )
+
+
+        elif command_type == "LDAP_ADD_GROUP":
+            # Data expected: {"group_name": "admins", "members": ["uid=jdoe,..."]}
+            return self.engine.add_group(
+                data.get("group_name"),
+                data.get("members")
+            )
+
+        else:
+            logger.warning(f"Unknown Ldap command type: {command_type}")
+            return {"status": "ERROR", "message": f"Command {command_type} not supported by ldap module"}
+
+    async def get_status(self) -> Dict[str, Any]:
+        """Native LM status report for the LDAP instance."""
+        health = self.engine.get_system_health()
+        return {
+            "spoke_id": self.spoke_id,
+            "module": "ldap-mgmt",
+            "api_health": health,
+            "connection": "CONNECTED" if health.get("status") == "SUCCESS" else "DISCONNECTED"
+        }
+
+    def get_version(self) -> str:
+        """Returns the current version of the Ldap module."""
+>>>>>>> 1b24d1f (Update LDAP module and configuration)
         return "1.0.0"
