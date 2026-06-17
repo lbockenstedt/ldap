@@ -19,10 +19,15 @@ class LdapControlPlane(BaseControlPlane):
         load_dotenv()
         self.config = {
             "LDAP_ADMIN_DN": os.getenv("LDAP_ADMIN_DN", "cn=admin,dc=example,dc=org"),
-            "LDAP_ADMIN_PW": os.getenv("LDAP_ADMIN_PW", "admin"),
+            "LDAP_ADMIN_PW": os.getenv("LDAP_ADMIN_PW", ""),
             "LDAP_BASE_DN": os.getenv("LDAP_BASE_DN", "dc=example,dc=org"),
             "LDAP_SERVER_URL": os.getenv("LDAP_SERVER_URL", "ldap://localhost:389"),
         }
+        if not self.config["LDAP_ADMIN_PW"]:
+            logger.warning(
+                "LDAP_ADMIN_PW is not set. The spoke cannot bind to the LDAP server "
+                "until it is configured in .env (must match your slapd admin password)."
+            )
 
     def register_module(self, name: str, module_instance: Any):
         self.modules[name] = module_instance

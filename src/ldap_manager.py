@@ -2,6 +2,7 @@ import ldap
 import ldap.filter
 from typing import Any, Dict, List, Optional
 import logging
+import secrets
 
 logger = logging.getLogger("LdapManager")
 
@@ -57,20 +58,23 @@ class LdapManager:
                 users.append(user_info)
         return users
 
-    def create_user(self, username: str, first_name: str, last_name: str, email: str, ou_dn: str) -> Dict[str, Any]:
+    def create_user(self, username: str, first_name: str, last_name: str, email: str, ou_dn: str, password: Optional[str] = None) -> Dict[str, Any]:
         conn = self._get_connection()
         dn = f"uid={username},{ou_dn}"
+        # Use a caller-provided password, or generate a strong random one (never a hardcoded default).
+        user_password = password or secrets.token_urlsafe(16)
         attrs = {
             'objectClass': [b'top', b'person', b'organizationalPerson', b'inetOrgPerson'],
             'cn': [f"{first_name} {last_name}".encode('utf-8')],
             'sn': [last_name.encode('utf-8')],
             'uid': [username.encode('utf-8')],
             'mail': [email.encode('utf-8')],
-            'userPassword': [b'password123'] # Default password, should be changed
+            'userPassword': [user_password.encode('utf-8')]
         }
         try:
             conn.add_s(dn, attrs)
-            return {"status": "SUCCESS", "dn": dn}
+            # Return the generated/provided password so the operator can deliver it securely.
+            return {"status": "SUCCESS", "dn": dn, "password": user_password}
         except ldap.LDAPError as e:
             logger.error(f"Error creating user {dn}: {e}")
             return {"status": "ERROR", "message": str(e)}

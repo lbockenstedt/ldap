@@ -58,7 +58,8 @@ class LdapSpoke(BaseSpoke):
                 data.get("first_name"),
                 data.get("last_name"),
                 data.get("email"),
-                data.get("ou_dn")
+                data.get("ou_dn"),
+                password=data.get("password")
             )
 
         if normalized_cmd == "LIST_GROUPS":
