@@ -3,9 +3,6 @@ import json
 import logging
 import argparse
 import os
-import threading
-import subprocess
-import git
 from typing import Any, Dict, Optional
 from core.src.messaging.control_plane import BaseControlPlane
 from src.ldap_spoke import LdapSpoke
@@ -13,39 +10,6 @@ from dotenv import load_dotenv
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("LdapControlPlane")
-
-def get_version():
-    try:
-        with open("VERSION", "r") as f:
-            return f.read().strip()
-    except FileNotFoundError:
-        return "unknown"
-
-version = get_version()
-
-def check_for_updates():
-    try:
-        self_repo = git.Repo(os.getcwd())
-        old_commit = self_repo.head.commit.hexsha
-        self_repo.remotes.origin.pull()
-        new_commit = self_repo.head.commit.hexsha
-        if old_commit != new_commit:
-            logger.info(f"New version detected! {old_commit[:7]} -> {new_commit[:7]}. Triggering restart...")
-            subprocess.Popen(["sudo", "systemctl", "restart", "lm-ldap"])
-            return True
-        return False
-    except Exception as e:
-        logger.warning(f"Self-update check failed: {e}")
-        return False
-
-def updater_worker():
-    while True:
-        try:
-            logger.info("Checking for self-updates...")
-            check_for_updates()
-        except Exception as e:
-            logger.error(f"Updater worker error: {e}")
-        time.sleep(3600)
 
 class LdapControlPlane(BaseControlPlane):
     def __init__(self, spoke_id: str, secret: str, hub_secret: str = None, hub_url: str = None):
@@ -64,13 +28,13 @@ class LdapControlPlane(BaseControlPlane):
         self.modules[name] = module_instance
         logger.info(f"Registered module: {name}")
 
+    def get_service_name(self) -> str:
+        """Systemd service name the Hub restarts on self-update."""
+        return "lm-ldap"
+
     async def run(self):
         """Native LM Spoke behavior."""
-        logger.info(f"Initializing module version: {version}")
         logger.info(f"Starting LDAP Module in HUB MODE -> {self.hub_url}")
-
-        # Start update worker
-        threading.Thread(target=updater_worker, daemon=True).start()
 
         # Create and register the LDAP module
         ldap_spoke = LdapSpoke(self.spoke_id, self.config)
