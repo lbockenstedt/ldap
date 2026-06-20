@@ -4,7 +4,10 @@ import logging
 import argparse
 import os
 from typing import Any, Dict, Optional
-from core.src.messaging.control_plane import BaseControlPlane
+try:
+    from core.src.messaging.control_plane import BaseControlPlane
+except ImportError:
+    from messaging.control_plane import BaseControlPlane
 from src.ldap_spoke import LdapSpoke
 from dotenv import load_dotenv
 
