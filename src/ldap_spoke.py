@@ -74,6 +74,13 @@ class LdapSpoke(BaseSpoke):
         if normalized_cmd == "REMOVE_USER_FROM_GROUP":
             return self.manager.remove_user_from_group(data.get("user_dn"), data.get("group_dn"))
 
+        if normalized_cmd == "SET_PASSWORD":
+            user_dn = data.get("user_dn") or data.get("dn")
+            password = data.get("password") or data.get("new_password")
+            if not user_dn or not password:
+                return {"status": "ERROR", "message": "Missing user_dn or password"}
+            return self.manager.set_password(user_dn, password)
+
         if normalized_cmd == "DELETE_ENTITY":
             return self.manager.delete_entity(data.get("dn"))
 

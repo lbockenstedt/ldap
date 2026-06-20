@@ -20,13 +20,12 @@ class LdapManager:
 
     def list_ous(self) -> List[Dict[str, Any]]:
         conn = self._get_connection()
-        search_filter = "(objectClass=organizationalUnit)"
-        results = conn.search_s(self.base_dn, ldap.SCOPE_SUBTREE, search_filter, ['dn'])
-
+        results = conn.search_s(self.base_dn, ldap.SCOPE_SUBTREE, "(objectClass=organizationalUnit)", ['ou', 'description'])
         ous = []
         for dn, attrs in results:
             if dn:
-                ous.append({"dn": dn})
+                ou_name = attrs.get('ou', [b''])[0].decode('utf-8') if attrs.get('ou') else dn.split(',')[0].split('=')[-1]
+                ous.append({"name": ou_name, "dn": dn})
         return ous
 
     def create_ou(self, ou_name: str, parent_dn: str = None) -> Dict[str, Any]:
@@ -45,17 +44,16 @@ class LdapManager:
 
     def list_users(self) -> List[Dict[str, Any]]:
         conn = self._get_connection()
-        search_filter = "(objectClass=person)"
-        results = conn.search_s(self.base_dn, ldap.SCOPE_SUBTREE, search_filter, ['dn', 'cn', 'sn', 'mail'])
-
+        results = conn.search_s(self.base_dn, ldap.SCOPE_SUBTREE, "(objectClass=person)", ['uid', 'cn', 'sn', 'givenName', 'mail'])
         users = []
         for dn, attrs in results:
             if dn:
-                user_info = {"dn": dn}
-                for attr in ['cn', 'sn', 'mail']:
-                    if attr in attrs:
-                        user_info[attr] = attrs[attr][0].decode('utf-8')
-                users.append(user_info)
+                uid = attrs.get('uid', [b''])[0].decode('utf-8') if attrs.get('uid') else dn.split(',')[0].split('=')[-1]
+                cn = attrs.get('cn', [b''])[0].decode('utf-8') if attrs.get('cn') else ''
+                sn = attrs.get('sn', [b''])[0].decode('utf-8') if attrs.get('sn') else ''
+                given = attrs.get('givenName', [b''])[0].decode('utf-8') if attrs.get('givenName') else cn.split(' ')[0] if cn else ''
+                mail = attrs.get('mail', [b''])[0].decode('utf-8') if attrs.get('mail') else ''
+                users.append({"username": uid, "cn": cn, "first_name": given, "last_name": sn, "email": mail, "dn": dn})
         return users
 
     def create_user(self, username: str, first_name: str, last_name: str, email: str, ou_dn: str, password: Optional[str] = None) -> Dict[str, Any]:
@@ -81,18 +79,18 @@ class LdapManager:
 
     def list_groups(self) -> List[Dict[str, Any]]:
         conn = self._get_connection()
-        search_filter = "(objectClass=groupOfNames)"
-        results = conn.search_s(self.base_dn, ldap.SCOPE_SUBTREE, search_filter, ['dn', 'cn', 'member'])
-
+        results = conn.search_s(self.base_dn, ldap.SCOPE_SUBTREE, "(|(objectClass=groupOfNames)(objectClass=posixGroup))", ['cn', 'member', 'memberUid', 'description'])
         groups = []
         for dn, attrs in results:
             if dn:
-                group_info = {"dn": dn}
-                if 'cn' in attrs:
-                    group_info['cn'] = attrs['cn'][0].decode('utf-8')
-                if 'member' in attrs:
-                    group_info['members'] = [m.decode('utf-8') for m in attrs['member']]
-                groups.append(group_info)
+                cn = attrs.get('cn', [b''])[0].decode('utf-8') if attrs.get('cn') else ''
+                members = [m.decode('utf-8') for m in attrs.get('member', [])]
+                groups.append({
+                    "name": cn,
+                    "dn": dn,
+                    "member_count": len(members),
+                    "members": members,
+                })
         return groups
 
     def create_group(self, group_name: str, ou_dn: str) -> Dict[str, Any]:
@@ -127,6 +125,20 @@ class LdapManager:
         except ldap.LDAPError as e:
             logger.error(f"Error removing user {user_dn} from group {group_dn}: {e}")
             return {"status": "ERROR", "message": str(e)}
+
+    def set_password(self, user_dn: str, new_password: str) -> Dict[str, Any]:
+        conn = self._get_connection()
+        try:
+            conn.passwd_s(user_dn, None, new_password.encode('utf-8'))
+            return {"status": "SUCCESS"}
+        except ldap.LDAPError:
+            # Fallback: use modify with userPassword attribute
+            try:
+                conn.modify_s(user_dn, [(ldap.MOD_REPLACE, 'userPassword', [new_password.encode('utf-8')])])
+                return {"status": "SUCCESS"}
+            except ldap.LDAPError as e:
+                logger.error(f"Error setting password for {user_dn}: {e}")
+                return {"status": "ERROR", "message": str(e)}
 
     def delete_entity(self, dn: str) -> Dict[str, Any]:
         conn = self._get_connection()
