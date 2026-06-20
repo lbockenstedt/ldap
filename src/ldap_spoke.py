@@ -84,6 +84,9 @@ class LdapSpoke(BaseSpoke):
         if normalized_cmd == "DELETE_ENTITY":
             return self.manager.delete_entity(data.get("dn"))
 
+        if normalized_cmd == "SEARCH_USERS":
+            return self.manager.search(data.get("q", ""))
+
         logger.warning(f"Unknown command received: {command_type}")
         return {"status": "ERROR", "message": f"Unknown command: {command_type}"}
 

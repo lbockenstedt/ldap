@@ -148,3 +148,50 @@ class LdapManager:
         except ldap.LDAPError as e:
             logger.error(f"Error deleting entity {dn}: {e}")
             return {"status": "ERROR", "message": str(e)}
+
+    def search(self, query: str) -> Dict[str, Any]:
+        """
+        Search LDAP for users and computers matching a name, username, email, or hostname.
+        Returns normalised results tagged source="ldap".
+        """
+        q = query.strip()
+        results: List[Dict] = []
+        try:
+            conn = self._get_connection()
+            # Escape special chars for LDAP filter
+            safe_q = q.replace("\\", "\\5c").replace("*", "\\2a").replace("(", "\\28").replace(")", "\\29")
+            ldap_filter = (
+                f"(|"
+                f"(uid=*{safe_q}*)"
+                f"(cn=*{safe_q}*)"
+                f"(mail=*{safe_q}*)"
+                f"(sn=*{safe_q}*)"
+                f"(givenName=*{safe_q}*)"
+                f"(dNSHostName=*{safe_q}*)"
+                f")"
+            )
+            attrs = ['uid', 'cn', 'sn', 'givenName', 'mail', 'objectClass', 'dNSHostName']
+            raw = conn.search_s(self.base_dn, ldap.SCOPE_SUBTREE, ldap_filter, attrs)
+            for dn, entry in raw:
+                if not dn:
+                    continue
+                obj_classes = [c.decode() if isinstance(c, bytes) else c
+                               for c in entry.get('objectClass', [])]
+                is_computer = 'computer' in obj_classes or 'device' in obj_classes
+                def _d(key: str) -> str:
+                    v = entry.get(key, [b''])[0]
+                    return (v.decode('utf-8') if isinstance(v, bytes) else v) if v else ''
+                results.append({
+                    "source":   "ldap",
+                    "type":     "computer" if is_computer else "user",
+                    "name":     _d('cn') or _d('uid'),
+                    "username": _d('uid'),
+                    "email":    _d('mail'),
+                    "dn":       dn,
+                    "hostname": _d('dNSHostName'),
+                    "id":       dn,
+                })
+        except Exception as e:
+            logger.error(f"LDAP search failed: {e}")
+            return {"status": "ERROR", "message": str(e), "results": []}
+        return {"status": "SUCCESS", "results": results, "count": len(results)}
