@@ -58,8 +58,25 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # 1. System dependencies: slapd (LDAP server) + build deps for python-ldap
+# Pre-seed slapd debconf answers so apt never shows an interactive password
+# dialog. The admin password set here is overwritten by dpkg-reconfigure
+# later, so it's just a placeholder to satisfy the installer.
 apt-get update
-apt-get install -y slapd ldap-utils python3-pip python3-venv git curl jq libldap2-dev libsasl2-dev
+apt-get install -y debconf-utils
+debconf-set-selections <<'DEBCONF'
+slapd slapd/internal/generated_adminpw password placeholder
+slapd slapd/internal/adminpw password placeholder
+slapd slapd/password2 password placeholder
+slapd slapd/password1 password placeholder
+slapd slapd/domain string lm.local
+slapd shared/organization string "Lab Manager"
+slapd slapd/backend select MDB
+slapd slapd/purge_database boolean true
+slapd slapd/move_old_database boolean true
+slapd slapd/allow_ldap_v2 boolean false
+slapd slapd/no_configuration boolean false
+DEBCONF
+DEBIAN_FRONTEND=noninteractive apt-get install -y slapd ldap-utils python3-pip python3-venv git curl jq libldap2-dev libsasl2-dev
 
 # Create a dedicated service user
 if ! id "svc_lm" &>/dev/null; then
