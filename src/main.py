@@ -14,6 +14,7 @@ logger = logging.getLogger("LdapControlPlane")
 class LdapControlPlane(BaseControlPlane):
     def __init__(self, spoke_id: str, secret: str, hub_secret: str = None, hub_url: str = None):
         super().__init__(spoke_id, secret, hub_secret, hub_url)
+        self.module_type = "directory"
 
         # Load config from .env if present
         load_dotenv()
