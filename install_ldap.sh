@@ -134,6 +134,8 @@ User=svc_lm
 WorkingDirectory=$INSTALL_DIR/ldap
 Environment="PYTHONPATH=$INSTALL_DIR/core/src:$INSTALL_DIR/ldap/src"
 ExecStart=$INSTALL_DIR/ldap/venv/bin/python3 -m src.main --id $SPOKE_ID --secret $SPOKE_SECRET --hub-secret $HUB_SECRET --hub $HUB_URL
+StandardOutput=append:/var/log/lm/lm-ldap.log
+StandardError=append:/var/log/lm/lm-ldap.log
 Restart=on-failure
 RestartSec=10
 
