@@ -125,11 +125,12 @@ fi
 
 # --- Persistence Configuration ---
 echo "⚙️ Configuring Spoke Identity..."
+mkdir -p /var/log/lm
 cat <<EOF > .env
 HUB_URL=$HUB_URL
 SPOKE_ID=$SPOKE_ID
 SPOKE_SECRET=$SPOKE_SECRET
-HUB_SECRET=$HUB_SECRET
+HUB_SECRET=${HUB_SECRET:-}
 LDAP_ADMIN_DN=cn=admin,dc=example,dc=org
 LDAP_BASE_DN=dc=example,dc=org
 LDAP_SERVER_URL=ldap://localhost:389
@@ -137,6 +138,11 @@ LDAP_SERVER_URL=ldap://localhost:389
 # the spoke will fail to bind until this is configured (fail-closed).
 LDAP_ADMIN_PW=
 EOF
+chmod 600 .env
+
+# Only pass --hub-secret when a value is set
+HUB_SECRET_ARG=""
+[ -n "${HUB_SECRET:-}" ] && HUB_SECRET_ARG="--hub-secret ${HUB_SECRET}"
 
 # --- Systemd Service (For Remote/Independent Deployment) ---
 echo "⚙️ Creating systemd service for auto-start..."
@@ -149,8 +155,9 @@ After=network.target slapd.service
 Type=simple
 User=svc_lm
 WorkingDirectory=$INSTALL_DIR/ldap
+EnvironmentFile=$INSTALL_DIR/ldap/.env
 Environment="PYTHONPATH=$INSTALL_DIR:$INSTALL_DIR/core/src:$INSTALL_DIR/ldap/src"
-ExecStart=$INSTALL_DIR/ldap/venv/bin/python3 -m src.main --id $SPOKE_ID --secret $SPOKE_SECRET --hub-secret $HUB_SECRET --hub $HUB_URL
+ExecStart=$INSTALL_DIR/ldap/venv/bin/python3 -m src.main --id $SPOKE_ID --secret \$SPOKE_SECRET $HUB_SECRET_ARG --hub $HUB_URL
 StandardOutput=append:/var/log/lm/lm-ldap.log
 StandardError=append:/var/log/lm/lm-ldap.log
 Restart=on-failure
@@ -162,6 +169,7 @@ EOF
 
 systemctl daemon-reload
 systemctl enable lm-ldap
+systemctl restart lm-ldap
 
 echo "🎉 LDAP Manager installation complete!"
 echo "🌐 Hub Target: $HUB_URL"
