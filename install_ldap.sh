@@ -39,7 +39,7 @@ if [ -z "$SPOKE_SECRET" ] || [ "$SPOKE_SECRET" == "lm-secret" ]; then
 
     SPOKE_SECRET=$(curl -s -X POST "$API_URL/setup/generate-secret" \
         -H "Content-Type: application/json" \
-        -H "Authorization: Bearer $ADMIN_TOKEN" \
+        -H "X-Admin-Token: $ADMIN_TOKEN" \
         -d "{\"spoke_id\": \"$SPOKE_ID\"}" | jq -r '.secret' 2>/dev/null) || true
 
     if [ "$SPOKE_SECRET" == "null" ] || [ -z "$SPOKE_SECRET" ]; then
