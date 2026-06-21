@@ -11,7 +11,11 @@ except ImportError:
 from src.ldap_spoke import LdapSpoke
 from dotenv import load_dotenv
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 logger = logging.getLogger("LdapControlPlane")
 
 class LdapControlPlane(BaseControlPlane):
