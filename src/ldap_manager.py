@@ -149,6 +149,69 @@ class LdapManager:
             logger.error(f"Error deleting entity {dn}: {e}")
             return {"status": "ERROR", "message": str(e)}
 
+    def _rename(self, conn, dn: str, new_rdn: str) -> None:
+        """Rename an entry's RDN (modrdn). The old RDN value is deleted."""
+        conn.rename_s(dn, new_rdn, delold=1)
+
+    def update_ou(self, dn: str, new_name: str) -> Dict[str, Any]:
+        """Rename an OU. The new DN is derived from the new ou= RDN."""
+        if not new_name:
+            return {"status": "ERROR", "message": "new_name is required"}
+        conn = self._get_connection()
+        try:
+            new_rdn = f"ou={new_name}"
+            self._rename(conn, dn, new_rdn)
+            parent = dn.split(',', 1)[1] if ',' in dn else ''
+            new_dn = f"{new_rdn},{parent}" if parent else new_rdn
+            return {"status": "SUCCESS", "dn": new_dn}
+        except ldap.LDAPError as e:
+            logger.error(f"Error renaming OU {dn}: {e}")
+            return {"status": "ERROR", "message": str(e)}
+
+    def update_user(self, dn: str, first_name: str = None, last_name: str = None,
+                    email: str = None, username: str = None) -> Dict[str, Any]:
+        """Update a user's attributes (cn/sn/givenName/mail) and optionally
+        rename the uid RDN. None values are left untouched."""
+        conn = self._get_connection()
+        mods = []
+        if first_name is not None and last_name is not None:
+            mods.append((ldap.MOD_REPLACE, 'cn', [f"{first_name} {last_name}".encode('utf-8')]))
+        if first_name is not None:
+            mods.append((ldap.MOD_REPLACE, 'givenName', [first_name.encode('utf-8')]))
+        if last_name is not None:
+            mods.append((ldap.MOD_REPLACE, 'sn', [last_name.encode('utf-8')]))
+        if email is not None:
+            mods.append((ldap.MOD_REPLACE, 'mail', [email.encode('utf-8')]))
+        try:
+            if mods:
+                conn.modify_s(dn, mods)
+            new_dn = dn
+            if username:
+                cur_uid = dn.split(',')[0].split('=', 1)[-1]
+                if username != cur_uid:
+                    self._rename(conn, dn, f"uid={username}")
+                    parent = dn.split(',', 1)[1] if ',' in dn else ''
+                    new_dn = f"uid={username},{parent}" if parent else f"uid={username}"
+            return {"status": "SUCCESS", "dn": new_dn}
+        except ldap.LDAPError as e:
+            logger.error(f"Error updating user {dn}: {e}")
+            return {"status": "ERROR", "message": str(e)}
+
+    def update_group(self, dn: str, new_name: str) -> Dict[str, Any]:
+        """Rename a group (cn RDN)."""
+        if not new_name:
+            return {"status": "ERROR", "message": "new_name is required"}
+        conn = self._get_connection()
+        try:
+            new_rdn = f"cn={new_name}"
+            self._rename(conn, dn, new_rdn)
+            parent = dn.split(',', 1)[1] if ',' in dn else ''
+            new_dn = f"{new_rdn},{parent}" if parent else new_rdn
+            return {"status": "SUCCESS", "dn": new_dn}
+        except ldap.LDAPError as e:
+            logger.error(f"Error renaming group {dn}: {e}")
+            return {"status": "ERROR", "message": str(e)}
+
     def search(self, query: str) -> Dict[str, Any]:
         """
         Search LDAP for users and computers matching a name, username, email, or hostname.

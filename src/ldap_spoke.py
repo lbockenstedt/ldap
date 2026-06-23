@@ -49,6 +49,9 @@ class LdapSpoke(BaseSpoke):
         if normalized_cmd == "CREATE_OU":
             return self.manager.create_ou(data.get("name"), data.get("parent_dn"))
 
+        if normalized_cmd == "UPDATE_OU":
+            return self.manager.update_ou(data.get("dn"), data.get("name"))
+
         if normalized_cmd == "LIST_USERS":
             return {"status": "SUCCESS", "data": self.manager.list_users()}
 
@@ -62,11 +65,23 @@ class LdapSpoke(BaseSpoke):
                 password=data.get("password")
             )
 
+        if normalized_cmd == "UPDATE_USER":
+            return self.manager.update_user(
+                data.get("dn"),
+                data.get("first_name"),
+                data.get("last_name"),
+                data.get("email"),
+                data.get("username"),
+            )
+
         if normalized_cmd == "LIST_GROUPS":
             return {"status": "SUCCESS", "data": self.manager.list_groups()}
 
         if normalized_cmd == "CREATE_GROUP":
             return self.manager.create_group(data.get("name"), data.get("ou_dn"))
+
+        if normalized_cmd == "UPDATE_GROUP":
+            return self.manager.update_group(data.get("dn"), data.get("name"))
 
         if normalized_cmd == "ADD_USER_TO_GROUP":
             return self.manager.add_user_to_group(data.get("user_dn"), data.get("group_dn"))
