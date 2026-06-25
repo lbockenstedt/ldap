@@ -114,7 +114,11 @@ LDAP_ADMIN_PW=
 EOF
 chmod 600 .env
 
-# Only pass --hub-secret when a value is set
+# Only pass --secret/--hub-secret when a value is set. Passing --secret with an
+# empty value makes argparse abort with "argument --secret: expected one
+# argument", crash-looping the service (zero-touch omits it and awaits approval).
+SECRET_ARG=""
+[ -n "$SPOKE_SECRET" ] && SECRET_ARG="--secret $SPOKE_SECRET"
 HUB_SECRET_ARG=""
 [ -n "${HUB_SECRET:-}" ] && HUB_SECRET_ARG="--hub-secret ${HUB_SECRET}"
 
@@ -131,10 +135,10 @@ User=svc_lm
 WorkingDirectory=$INSTALL_DIR/ldap
 EnvironmentFile=$INSTALL_DIR/ldap/.env
 Environment="PYTHONPATH=$INSTALL_DIR:$INSTALL_DIR/core/src:$INSTALL_DIR/ldap/src"
-ExecStart=$INSTALL_DIR/ldap/venv/bin/python3 -m src.main --id $SPOKE_ID --secret \$SPOKE_SECRET $HUB_SECRET_ARG --hub $HUB_URL
+ExecStart=$INSTALL_DIR/ldap/venv/bin/python3 -m src.main --id $SPOKE_ID --hub $HUB_URL $SECRET_ARG $HUB_SECRET_ARG
 StandardOutput=append:/var/log/lm/lm-ldap.log
 StandardError=append:/var/log/lm/lm-ldap.log
-Restart=on-failure
+Restart=always
 RestartSec=10
 
 [Install]
