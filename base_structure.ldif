@@ -1,0 +1,21 @@
+# Base Organizational Units
+dn: ou=People,dc=EXAMPLE,dc=COM
+ou: People
+objectClass: organizationalUnit
+
+dn: ou=Groups,dc=EXAMPLE,dc=COM
+ou: Groups
+objectClass: organizationalUnit
+
+# Example User
+dn: cn=admin_user,ou=People,dc=EXAMPLE,dc=COM
+cn: admin_user
+sn: User
+objectClass: inetOrgPerson
+objectClass: posixAccount
+uid: admin_user
+uidNumber: 1000
+gidNumber: 1000
+homeDirectory: /home/admin_user
+loginShell: /bin/bash
+userPassword: password123

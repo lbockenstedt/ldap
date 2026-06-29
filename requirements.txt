@@ -1,0 +1,9 @@
+flask
+python-ldap
+python-dotenv
+websockets
+requests
+ldap3
+fastapi
+uvicorn
+gitpython
