@@ -116,5 +116,9 @@ class LdapSpoke(BaseSpoke):
             return {"status": "UNHEALTHY", "error": str(e)}
 
     def get_version(self) -> str:
-        """Returns the current version of the LDAP module."""
-        return "1.0.0"
+        """Returns the current version of the LDAP module (from the VERSION file)."""
+        from pathlib import Path
+        try:
+            return (Path(__file__).parent.parent / "VERSION").read_text().strip()
+        except Exception:
+            return "unknown"
