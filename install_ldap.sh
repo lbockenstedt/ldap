@@ -3,7 +3,7 @@ set -e
 
 # Default Configuration
 HUB_URL="ws://localhost:8765"
-SPOKE_ID="ldap-spoke-1"
+SPOKE_ID="${SPOKE_ID:-ldap-$(hostname -s)}"
 SPOKE_SECRET="lm-secret"
 
 # Parse arguments
