@@ -2,7 +2,13 @@
 set -e
 
 # Default Configuration
-HUB_URL="ws://localhost:8765"
+# HUB_URL defaults to "auto": the spoke auto-discovers the hub (DNS
+# lm-hub.<suffix> then mDNS) on each connect via BaseControlPlane. The old
+# "ws://localhost:8765" default is BROKEN now that the hub's bare 8765 listener
+# was retired by the unified-:443 merge (the hub serves only on :443); a
+# co-located spoke dialed a dead port and a remote one dialed its own localhost.
+# Pass --hub <url> to pin.
+HUB_URL="${HUB_URL:-auto}"
 SPOKE_ID="${SPOKE_ID:-ldap-$(hostname -s)}"
 SPOKE_SECRET="lm-secret"
 
@@ -131,7 +137,11 @@ After=network.target slapd.service
 
 [Service]
 Type=simple
-User=svc_lm
+# Runs as root: INSTALL_CERT (hub-brokered Let's Encrypt cert install) writes
+# /etc/ldap/tls, runs `ldapmodify -Y EXTERNAL -H ldapi:///` against cn=config
+# (root peer-cred → cn=config write), and `systemctl restart slapd` — all need
+# root. Mirrors the le cert spoke (User=root because cert ops need root).
+User=root
 WorkingDirectory=$INSTALL_DIR/ldap
 EnvironmentFile=$INSTALL_DIR/ldap/.env
 Environment="PYTHONPATH=$INSTALL_DIR:$INSTALL_DIR/core/src:$INSTALL_DIR/ldap/src"
