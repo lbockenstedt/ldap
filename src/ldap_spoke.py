@@ -243,9 +243,22 @@ class LdapSpoke(BaseSpoke):
 
     @staticmethod
     def _write_pem(path: str, content: str, mode: int) -> None:
-        with open(path, "w") as f:
-            f.write(content)
-        os.chmod(path, mode)
+        # Atomic + correct-mode-from-creation: create the temp file with `mode` so
+        # a 0600 key is never briefly world-readable, then os.replace (a crash
+        # mid-write leaves the old file intact, not a truncated cert/key).
+        tmp = f"{path}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(content)
+            os.chmod(tmp, mode)  # os.open honors umask; enforce the exact mode
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     async def _ldapmodify(self, ldif: str) -> None:
         """Apply an LDIF to cn=config via SASL EXTERNAL over ldapi:/// (root
