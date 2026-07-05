@@ -1,7 +1,11 @@
 import ldap
 import ldap.filter
+import ldap.dn
 from typing import Any, Dict, List, Optional
+import base64
+import hashlib
 import logging
+import os
 import secrets
 
 logger = logging.getLogger("LdapManager")
@@ -18,6 +22,23 @@ class LdapManager:
         conn.simple_bind_s(self.admin_dn, self.admin_pw)
         return conn
 
+    @staticmethod
+    def _escape_rdn(value: str) -> str:
+        """Escape a value for safe use as a DN RDN component. Prevents DN
+        injection — a name containing ``, + = \\ <`` (or a leading space) could
+        otherwise reparent the entry (e.g. uid ``foo,ou=admins`` → placed under
+        ``ou=admins``). The spoke binds as admin, so this is security-critical."""
+        return ldap.dn.escape_dn_chars(value or "")
+
+    @staticmethod
+    def _ssha(password: str) -> bytes:
+        """{SSHA} hash for ``userPassword``. slapd does NOT hash a plain add/modify
+        of userPassword (only the Password-Modify ext-op does), so hash before
+        storing to avoid cleartext passwords at rest."""
+        salt = os.urandom(4)
+        digest = hashlib.sha1(password.encode('utf-8') + salt).digest()
+        return b'{SSHA}' + base64.b64encode(digest + salt)
+
     def list_ous(self) -> List[Dict[str, Any]]:
         conn = self._get_connection()
         results = conn.search_s(self.base_dn, ldap.SCOPE_SUBTREE, "(objectClass=organizationalUnit)", ['ou', 'description'])
@@ -30,7 +51,7 @@ class LdapManager:
 
     def create_ou(self, ou_name: str, parent_dn: str = None) -> Dict[str, Any]:
         conn = self._get_connection()
-        dn = f"ou={ou_name},{parent_dn if parent_dn else self.base_dn}"
+        dn = f"ou={self._escape_rdn(ou_name)},{parent_dn if parent_dn else self.base_dn}"
         attrs = {
             'objectClass': [b'organizationalUnit'],
             'ou': [ou_name.encode('utf-8')]
@@ -58,7 +79,7 @@ class LdapManager:
 
     def create_user(self, username: str, first_name: str, last_name: str, email: str, ou_dn: str, password: Optional[str] = None) -> Dict[str, Any]:
         conn = self._get_connection()
-        dn = f"uid={username},{ou_dn}"
+        dn = f"uid={self._escape_rdn(username)},{ou_dn}"
         # Use a caller-provided password, or generate a strong random one (never a hardcoded default).
         user_password = password or secrets.token_urlsafe(16)
         attrs = {
@@ -67,7 +88,7 @@ class LdapManager:
             'sn': [last_name.encode('utf-8')],
             'uid': [username.encode('utf-8')],
             'mail': [email.encode('utf-8')],
-            'userPassword': [user_password.encode('utf-8')]
+            'userPassword': [self._ssha(user_password)]  # {SSHA}, not cleartext
         }
         try:
             conn.add_s(dn, attrs)
@@ -95,7 +116,7 @@ class LdapManager:
 
     def create_group(self, group_name: str, ou_dn: str) -> Dict[str, Any]:
         conn = self._get_connection()
-        dn = f"cn={group_name},{ou_dn}"
+        dn = f"cn={self._escape_rdn(group_name)},{ou_dn}"
         attrs = {
             'objectClass': [b'groupOfNames'],
             'cn': [group_name.encode('utf-8')],
@@ -134,7 +155,7 @@ class LdapManager:
         except ldap.LDAPError:
             # Fallback: use modify with userPassword attribute
             try:
-                conn.modify_s(user_dn, [(ldap.MOD_REPLACE, 'userPassword', [new_password.encode('utf-8')])])
+                conn.modify_s(user_dn, [(ldap.MOD_REPLACE, 'userPassword', [self._ssha(new_password)])])
                 return {"status": "SUCCESS"}
             except ldap.LDAPError as e:
                 logger.error(f"Error setting password for {user_dn}: {e}")
@@ -159,7 +180,7 @@ class LdapManager:
             return {"status": "ERROR", "message": "new_name is required"}
         conn = self._get_connection()
         try:
-            new_rdn = f"ou={new_name}"
+            new_rdn = f"ou={self._escape_rdn(new_name)}"
             self._rename(conn, dn, new_rdn)
             parent = dn.split(',', 1)[1] if ',' in dn else ''
             new_dn = f"{new_rdn},{parent}" if parent else new_rdn
@@ -189,9 +210,10 @@ class LdapManager:
             if username:
                 cur_uid = dn.split(',')[0].split('=', 1)[-1]
                 if username != cur_uid:
-                    self._rename(conn, dn, f"uid={username}")
+                    euid = self._escape_rdn(username)
+                    self._rename(conn, dn, f"uid={euid}")
                     parent = dn.split(',', 1)[1] if ',' in dn else ''
-                    new_dn = f"uid={username},{parent}" if parent else f"uid={username}"
+                    new_dn = f"uid={euid},{parent}" if parent else f"uid={euid}"
             return {"status": "SUCCESS", "dn": new_dn}
         except ldap.LDAPError as e:
             logger.error(f"Error updating user {dn}: {e}")
@@ -203,7 +225,7 @@ class LdapManager:
             return {"status": "ERROR", "message": "new_name is required"}
         conn = self._get_connection()
         try:
-            new_rdn = f"cn={new_name}"
+            new_rdn = f"cn={self._escape_rdn(new_name)}"
             self._rename(conn, dn, new_rdn)
             parent = dn.split(',', 1)[1] if ',' in dn else ''
             new_dn = f"{new_rdn},{parent}" if parent else new_rdn
