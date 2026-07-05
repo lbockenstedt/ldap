@@ -50,65 +50,61 @@ class LdapSpoke(BaseSpoke):
             )
             return {"status": "SUCCESS", "message": "LDAP configuration updated"}
 
-        # LDAP Management Commands
+        # LDAP Management Commands. The python-ldap calls are SYNC + blocking, so
+        # run each in a worker thread — a slow/unreachable slapd must not stall the
+        # asyncio event loop, which would freeze this spoke's heartbeats and get it
+        # disconnected by the hub (and queue every other command behind it).
         if normalized_cmd == "LIST_OUS":
-            return {"status": "SUCCESS", "data": self.manager.list_ous()}
+            return {"status": "SUCCESS", "data": await asyncio.to_thread(self.manager.list_ous)}
 
         if normalized_cmd == "CREATE_OU":
-            return self.manager.create_ou(data.get("name"), data.get("parent_dn"))
+            return await asyncio.to_thread(self.manager.create_ou, data.get("name"), data.get("parent_dn"))
 
         if normalized_cmd == "UPDATE_OU":
-            return self.manager.update_ou(data.get("dn"), data.get("name"))
+            return await asyncio.to_thread(self.manager.update_ou, data.get("dn"), data.get("name"))
 
         if normalized_cmd == "LIST_USERS":
-            return {"status": "SUCCESS", "data": self.manager.list_users()}
+            return {"status": "SUCCESS", "data": await asyncio.to_thread(self.manager.list_users)}
 
         if normalized_cmd == "CREATE_USER":
-            return self.manager.create_user(
-                data.get("username"),
-                data.get("first_name"),
-                data.get("last_name"),
-                data.get("email"),
-                data.get("ou_dn"),
-                password=data.get("password")
-            )
+            return await asyncio.to_thread(
+                self.manager.create_user,
+                data.get("username"), data.get("first_name"), data.get("last_name"),
+                data.get("email"), data.get("ou_dn"), data.get("password"))
 
         if normalized_cmd == "UPDATE_USER":
-            return self.manager.update_user(
-                data.get("dn"),
-                data.get("first_name"),
-                data.get("last_name"),
-                data.get("email"),
-                data.get("username"),
-            )
+            return await asyncio.to_thread(
+                self.manager.update_user,
+                data.get("dn"), data.get("first_name"), data.get("last_name"),
+                data.get("email"), data.get("username"))
 
         if normalized_cmd == "LIST_GROUPS":
-            return {"status": "SUCCESS", "data": self.manager.list_groups()}
+            return {"status": "SUCCESS", "data": await asyncio.to_thread(self.manager.list_groups)}
 
         if normalized_cmd == "CREATE_GROUP":
-            return self.manager.create_group(data.get("name"), data.get("ou_dn"))
+            return await asyncio.to_thread(self.manager.create_group, data.get("name"), data.get("ou_dn"))
 
         if normalized_cmd == "UPDATE_GROUP":
-            return self.manager.update_group(data.get("dn"), data.get("name"))
+            return await asyncio.to_thread(self.manager.update_group, data.get("dn"), data.get("name"))
 
         if normalized_cmd == "ADD_USER_TO_GROUP":
-            return self.manager.add_user_to_group(data.get("user_dn"), data.get("group_dn"))
+            return await asyncio.to_thread(self.manager.add_user_to_group, data.get("user_dn"), data.get("group_dn"))
 
         if normalized_cmd == "REMOVE_USER_FROM_GROUP":
-            return self.manager.remove_user_from_group(data.get("user_dn"), data.get("group_dn"))
+            return await asyncio.to_thread(self.manager.remove_user_from_group, data.get("user_dn"), data.get("group_dn"))
 
         if normalized_cmd == "SET_PASSWORD":
             user_dn = data.get("user_dn") or data.get("dn")
             password = data.get("password") or data.get("new_password")
             if not user_dn or not password:
                 return {"status": "ERROR", "message": "Missing user_dn or password"}
-            return self.manager.set_password(user_dn, password)
+            return await asyncio.to_thread(self.manager.set_password, user_dn, password)
 
         if normalized_cmd == "DELETE_ENTITY":
-            return self.manager.delete_entity(data.get("dn"))
+            return await asyncio.to_thread(self.manager.delete_entity, data.get("dn"))
 
         if normalized_cmd == "SEARCH_USERS":
-            return self.manager.search(data.get("q", ""))
+            return await asyncio.to_thread(self.manager.search, data.get("q", ""))
 
         if normalized_cmd == "INSTALL_CERT":
             # Hub-brokered Let's Encrypt cert install. The le spoke issued/
@@ -130,8 +126,8 @@ class LdapSpoke(BaseSpoke):
     async def get_status(self) -> Dict[str, Any]:
         """Reports LDAP server status."""
         try:
-            # Simple check to see if we can connect
-            self.manager._get_connection()
+            # Leak-free connectivity check (binds + unbinds), off the event loop.
+            await asyncio.to_thread(self.manager.check_connection)
             return {"status": "HEALTHY", "server": "OpenLDAP Online"}
         except Exception as e:
             logger.error(f"LDAP server health check failed: {e}")

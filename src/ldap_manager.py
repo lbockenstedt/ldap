@@ -7,6 +7,7 @@ import hashlib
 import logging
 import os
 import secrets
+from contextlib import contextmanager
 
 logger = logging.getLogger("LdapManager")
 
@@ -21,6 +22,26 @@ class LdapManager:
         conn = ldap.initialize(self.server)
         conn.simple_bind_s(self.admin_dn, self.admin_pw)
         return conn
+
+    @contextmanager
+    def _conn(self):
+        """Bound connection that is ALWAYS unbound afterwards — fixes the socket/FD
+        leak from _get_connection (bound per call, never closed), which exhausted
+        slapd's conn limit on a long-running spoke."""
+        conn = ldap.initialize(self.server)
+        try:
+            conn.simple_bind_s(self.admin_dn, self.admin_pw)
+            yield conn
+        finally:
+            try:
+                conn.unbind_s()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def check_connection(self) -> bool:
+        """Health check that binds + unbinds (no leak). Raises on failure."""
+        with self._conn():
+            return True
 
     @staticmethod
     def _escape_rdn(value: str) -> str:
@@ -40,8 +61,8 @@ class LdapManager:
         return b'{SSHA}' + base64.b64encode(digest + salt)
 
     def list_ous(self) -> List[Dict[str, Any]]:
-        conn = self._get_connection()
-        results = conn.search_s(self.base_dn, ldap.SCOPE_SUBTREE, "(objectClass=organizationalUnit)", ['ou', 'description'])
+        with self._conn() as conn:
+            results = conn.search_s(self.base_dn, ldap.SCOPE_SUBTREE, "(objectClass=organizationalUnit)", ['ou', 'description'])
         ous = []
         for dn, attrs in results:
             if dn:
@@ -64,8 +85,8 @@ class LdapManager:
             return {"status": "ERROR", "message": str(e)}
 
     def list_users(self) -> List[Dict[str, Any]]:
-        conn = self._get_connection()
-        results = conn.search_s(self.base_dn, ldap.SCOPE_SUBTREE, "(objectClass=person)", ['uid', 'cn', 'sn', 'givenName', 'mail'])
+        with self._conn() as conn:
+            results = conn.search_s(self.base_dn, ldap.SCOPE_SUBTREE, "(objectClass=person)", ['uid', 'cn', 'sn', 'givenName', 'mail'])
         users = []
         for dn, attrs in results:
             if dn:
@@ -99,8 +120,8 @@ class LdapManager:
             return {"status": "ERROR", "message": str(e)}
 
     def list_groups(self) -> List[Dict[str, Any]]:
-        conn = self._get_connection()
-        results = conn.search_s(self.base_dn, ldap.SCOPE_SUBTREE, "(|(objectClass=groupOfNames)(objectClass=posixGroup))", ['cn', 'member', 'memberUid', 'description'])
+        with self._conn() as conn:
+            results = conn.search_s(self.base_dn, ldap.SCOPE_SUBTREE, "(|(objectClass=groupOfNames)(objectClass=posixGroup))", ['cn', 'member', 'memberUid', 'description'])
         groups = []
         for dn, attrs in results:
             if dn:
