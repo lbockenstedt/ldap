@@ -11,11 +11,23 @@ except ImportError:
 from src.ldap_spoke import LdapSpoke
 from dotenv import load_dotenv
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
+# Shared logging setup (standard format + LOG_LEVEL env + line buffering) so
+# every module logs identically; falls back to an equivalent inline config when
+# lm core isn't importable. See logging-observability-contract.md (normalization).
+try:
+    from logging_setup import configure_logging
+except ImportError:
+    try:
+        from core.src.logging_setup import configure_logging
+    except ImportError:
+        _FMT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        _DFMT = '%Y-%m-%d %H:%M:%S'
+        def configure_logging(default_level=logging.INFO, *, log_file=None, **_):
+            handlers = ([logging.FileHandler(log_file), logging.StreamHandler()]
+                        if log_file else None)
+            logging.basicConfig(level=default_level, force=True,
+                                 format=_FMT, datefmt=_DFMT, handlers=handlers)
+configure_logging()
 logger = logging.getLogger("LdapControlPlane")
 
 class LdapControlPlane(BaseControlPlane):
