@@ -36,8 +36,11 @@ _ldap.MOD_DELETE = 1
 _ldap.MOD_REPLACE = 2
 _ldap.initialize = lambda url: None
 _ldap.filter = types.ModuleType("ldap.filter")
+_ldap.dn = types.ModuleType("ldap.dn")
+_ldap.dn.escape_dn_chars = lambda v: v  # identity stub (real one escapes DN chars)
 sys.modules["ldap"] = _ldap
 sys.modules["ldap.filter"] = _ldap.filter
+sys.modules["ldap.dn"] = _ldap.dn
 
 SRC = _PXMX_ROOT / "src"
 _pkg = types.ModuleType("ldap_src_pkg")
