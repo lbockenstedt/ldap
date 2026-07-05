@@ -78,7 +78,7 @@ cd "$INSTALL_DIR"
 
 if [ -d "ldap/.git" ]; then
     echo "📂 LDAP repository already exists. Updating..."
-    cd ldap && git pull && cd ..
+    cd ldap && git fetch origin -q && git reset --hard origin/main && cd ..   # hard-sync (soft `git pull` no-ops on a diverged/detached clone)
 else
     echo "🌐 Cloning LDAP Manager repository..."
     git clone https://github.com/lbockenstedt/ldap.git
