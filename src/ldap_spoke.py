@@ -32,6 +32,14 @@ class LdapSpoke(BaseSpoke):
         )
 
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Dispatch a hub command to the matching ``LdapManager`` method.
+
+        Command type is matched case-insensitively. The blocking
+        ``python-ldap`` calls run via :func:`asyncio.to_thread` so a slow or
+        unreachable slapd cannot stall the event loop (which would freeze this
+        spoke's heartbeats and get it disconnected). ``GET_VERSION`` and
+        ``UPDATE_CONFIG`` are handled inline; ``INSTALL_CERT`` is async-native
+        (subprocess + filesystem writes). Returns ``{"status": "SUCCESS"|"ERROR", ...}``."""
         # Normalize command type to uppercase for case-insensitive matching
         normalized_cmd = command_type.upper()
 

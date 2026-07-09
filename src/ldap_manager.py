@@ -12,6 +12,18 @@ from contextlib import contextmanager
 logger = logging.getLogger("LdapManager")
 
 class LdapManager:
+    """Synchronous LDAP CRUD wrapper over ``python-ldap``.
+
+    Bound once at construction with admin creds + base DN + server URL and reused
+    across commands. Read/list operations and the health check use the leak-free
+    :meth:`_conn` context manager (bind + always-unbind); write operations
+    (create/update/delete, group membership, set-password) still call
+    :meth:`_get_connection`, which binds but does not explicitly unbind. All
+    public methods return ``{"status": ..., ...}`` dicts ready for the spoke to
+    relay to the hub. DN components are escaped via :meth:`_escape_rdn` and
+    filter values are RFC-4515 escaped in :meth:`search` to prevent DN/filter
+    injection (the spoke binds as admin, so this is security-critical)."""
+
     def __init__(self, admin_dn: str, admin_pw: str, base_dn: str, server_url: str = "ldap://localhost:389"):
         self.admin_dn = admin_dn
         self.admin_pw = admin_pw
