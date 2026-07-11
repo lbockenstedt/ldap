@@ -15,11 +15,10 @@ except Exception:
     pass
 
 import asyncio
-import json
 import logging
 import argparse
 import os
-from typing import Any, Dict, Optional
+from typing import Any
 try:
     from core.src.messaging.control_plane import BaseControlPlane
 except ImportError:
