@@ -207,6 +207,52 @@ class LdapManager:
         """Rename an entry's RDN (modrdn). The old RDN value is deleted."""
         conn.rename_s(dn, new_rdn, delold=1)
 
+    def migrate_tenant(self, source_base_dn: str, target_base_dn: str,
+                       purge_source: bool = False) -> Dict[str, Any]:
+        """Re-home every direct child of ``source_base_dn`` under
+        ``target_base_dn`` (LDAP moddn with newsuperior — each child's own
+        subtree moves with it). Used by cross-tenant migration when a tenant's
+        ldap_base_dn changes. Optionally delete the now-empty source container.
+        No-op when source == target or the source has no children. Returns the
+        moved DNs; any per-entry error keeps the source (no purge)."""
+        source_base_dn = (source_base_dn or "").strip()
+        target_base_dn = (target_base_dn or "").strip()
+        if not source_base_dn or not target_base_dn:
+            return {"status": "ERROR", "message": "source and target base DN are required"}
+        if source_base_dn.lower() == target_base_dn.lower():
+            return {"status": "SUCCESS", "moved": [], "count": 0,
+                    "message": "source and target base DN are the same"}
+        moved: List[str] = []
+        errors: Dict[str, str] = {}
+        try:
+            with self._conn() as conn:
+                try:
+                    children = conn.search_s(source_base_dn, ldap.SCOPE_ONELEVEL,
+                                             "(objectClass=*)", ['dn'])
+                except ldap.NO_SUCH_OBJECT:
+                    return {"status": "SUCCESS", "moved": [], "count": 0,
+                            "message": f"source '{source_base_dn}' not found — nothing to migrate"}
+                for dn, _attrs in children:
+                    rdn = dn.split(",", 1)[0]
+                    try:
+                        # newsuperior=target_base_dn moves the entry (and its
+                        # subtree) under the target; delold=1 drops the old RDN val.
+                        conn.rename_s(dn, rdn, target_base_dn, 1)
+                        moved.append(dn)
+                    except ldap.LDAPError as e:
+                        errors[dn] = str(e)
+                if purge_source and not errors:
+                    try:
+                        conn.delete_s(source_base_dn)
+                    except ldap.LDAPError as e:
+                        errors["delete_source"] = str(e)
+        except Exception as e:  # noqa: BLE001
+            return {"status": "ERROR", "message": str(e)}
+        status = "SUCCESS" if not errors else "PARTIAL"
+        return {"status": status, "moved": moved, "count": len(moved), "errors": errors,
+                "message": (f"moved {len(moved)} entry(ies) to '{target_base_dn}'"
+                            + (f", {len(errors)} error(s)" if errors else ""))}
+
     def update_ou(self, dn: str, new_name: str) -> Dict[str, Any]:
         """Rename an OU. The new DN is derived from the new ou= RDN."""
         if not new_name:

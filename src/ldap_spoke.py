@@ -114,6 +114,14 @@ class LdapSpoke(BaseSpoke):
         if normalized_cmd == "SEARCH_USERS":
             return await asyncio.to_thread(self.manager.search, data.get("q", ""))
 
+        if normalized_cmd == "LDAP_MIGRATE_TENANT":
+            # Cross-tenant migration: re-home entries from source_base_dn to
+            # target_base_dn (a tenant's ldap_base_dn changed).
+            return await asyncio.to_thread(
+                self.manager.migrate_tenant,
+                data.get("source_base_dn", ""), data.get("target_base_dn", ""),
+                bool(data.get("purge_source", False)))
+
         if normalized_cmd == "INSTALL_CERT":
             # Hub-brokered Let's Encrypt cert install. The le spoke issued/
             # renewed a cert and the hub pushes the PEM here; we write the
