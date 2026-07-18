@@ -57,6 +57,15 @@ class LdapControlPlane(BaseControlPlane):
             "LDAP_ADMIN_PW": os.getenv("LDAP_ADMIN_PW", ""),
             "LDAP_BASE_DN": os.getenv("LDAP_BASE_DN", "dc=example,dc=org"),
             "LDAP_SERVER_URL": os.getenv("LDAP_SERVER_URL", "ldap://localhost:389"),
+            # 2-node syncrepl mirror-mode (int 1|2 + JSON list of peer URLs).
+            "LDAP_SERVER_ID": os.getenv("LDAP_SERVER_ID", ""),
+            "LDAP_MIRROR_PEERS": os.getenv("LDAP_MIRROR_PEERS", ""),
+            # Entra ROPC pass-through (cert-based confidential client).
+            "ENTRA_TENANT_ID": os.getenv("ENTRA_TENANT_ID", ""),
+            "ENTRA_CLIENT_ID": os.getenv("ENTRA_CLIENT_ID", ""),
+            "ENTRA_CLIENT_CERT": os.getenv("ENTRA_CLIENT_CERT", ""),
+            "ENTRA_CLIENT_KEY": os.getenv("ENTRA_CLIENT_KEY", ""),
+            "ENTRA_ROPC_SCOPE": os.getenv("ENTRA_ROPC_SCOPE", "openid"),
         }
         if not self.config["LDAP_ADMIN_PW"]:
             logger.warning(

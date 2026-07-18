@@ -1,8 +1,10 @@
 import asyncio
+import json
 import logging
 import os
 import re
 import shutil
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 try:
     from base_spoke import BaseSpoke
@@ -10,6 +12,10 @@ except ImportError:
     from core.src.base_spoke import BaseSpoke
 
 from .ldap_manager import LdapManager
+try:
+    from . import replication
+except ImportError:  # loaded outside the src package
+    import replication
 
 logger = logging.getLogger("LdapSpoke")
 
@@ -47,7 +53,9 @@ class LdapSpoke(BaseSpoke):
             return {"status": "SUCCESS", "version": self.get_version()}
 
         if normalized_cmd == "UPDATE_CONFIG":
-            logger.info(f"Updating LDAP configuration: {data}")
+            # Redact secrets before logging (admin pw, entra client key/cert path
+            # are sensitive-ish; the admin pw certainly).
+            logger.info("Updating LDAP configuration (keys: %s)", sorted(data.keys()))
             self.config = data
             # Re-initialize manager with new config
             self.manager = LdapManager(
@@ -56,7 +64,25 @@ class LdapSpoke(BaseSpoke):
                 base_dn=self.config.get("LDAP_BASE_DN", "dc=example,dc=org"),
                 server_url=self.config.get("LDAP_SERVER_URL", "ldap://localhost:389")
             )
-            return {"status": "SUCCESS", "message": "LDAP configuration updated"}
+            notes = []
+            # Entra ROPC config changes: persist to .env so the pam_exec ROPC
+            # bridge (src/entra_ropc_auth.py) picks them up on the next bind. No
+            # slapd restart needed (the script reads .env live per-bind).
+            if any(k.startswith("ENTRA_") for k in data) or "LDAP_BASE_DN" in data:
+                try:
+                    self._persist_env(data)
+                    notes.append("entra .env persisted")
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("UPDATE_CONFIG: could not persist .env: %s", e)
+                    notes.append(f"env persist failed: {str(e)[:120]}")
+            # Mirror-mode replication changes: re-apply cn=config idempotently.
+            # Best-effort (only works when co-located on the slapd host as root);
+            # a failure is logged + surfaced but does not fail the config update.
+            if data.get("LDAP_SERVER_ID") and data.get("LDAP_MIRROR_PEERS"):
+                repl = await self._apply_replication_config(data)
+                notes.append(repl)
+            return {"status": "SUCCESS", "message": "LDAP configuration updated",
+                    "notes": notes}
 
         # LDAP Management Commands. The python-ldap calls are SYNC + blocking, so
         # run each in a worker thread — a slow/unreachable slapd must not stall the
@@ -121,6 +147,63 @@ class LdapSpoke(BaseSpoke):
                 self.manager.migrate_tenant,
                 data.get("source_base_dn", ""), data.get("target_base_dn", ""),
                 bool(data.get("purge_source", False)))
+
+        # ── Tenant-scoped commands (LDAP_* contract; TENANT == OU 1:1) ─────
+        # All accept an optional tenant_slug; absent = base level (back-compat).
+        if normalized_cmd == "LDAP_PROVISION_TENANT_OU":
+            return await asyncio.to_thread(
+                self.manager.provision_tenant_ou, data.get("tenant_slug"))
+
+        if normalized_cmd == "LDAP_CREATE_USER":
+            return await asyncio.to_thread(
+                self.manager.create_user_scoped,
+                data.get("uid"), data.get("attrs") or {}, data.get("tenant_slug"),
+                data.get("auth_mode", "local"), data.get("upn"), data.get("password"))
+
+        if normalized_cmd == "LDAP_UPDATE_USER":
+            return await asyncio.to_thread(
+                self.manager.update_user_scoped,
+                data.get("uid"), data.get("attrs") or {}, data.get("tenant_slug"))
+
+        if normalized_cmd == "LDAP_DELETE_USER":
+            return await asyncio.to_thread(
+                self.manager.delete_user_scoped,
+                data.get("uid"), data.get("tenant_slug"))
+
+        if normalized_cmd == "LDAP_SET_PASSWORD":
+            return await asyncio.to_thread(
+                self.manager.set_password_scoped,
+                data.get("uid"), data.get("password"), data.get("tenant_slug"))
+
+        if normalized_cmd == "LDAP_CREATE_GROUP":
+            return await asyncio.to_thread(
+                self.manager.create_group_scoped,
+                data.get("cn") or data.get("name"), data.get("tenant_slug"))
+
+        if normalized_cmd == "LDAP_ADD_MEMBER":
+            return await asyncio.to_thread(
+                self.manager.add_member_scoped,
+                data.get("uid"), data.get("group") or data.get("cn"),
+                data.get("tenant_slug"))
+
+        if normalized_cmd == "LDAP_REMOVE_MEMBER":
+            return await asyncio.to_thread(
+                self.manager.remove_member_scoped,
+                data.get("uid"), data.get("group") or data.get("cn"),
+                data.get("tenant_slug"))
+
+        if normalized_cmd == "LDAP_LIST_USERS":
+            return {"status": "SUCCESS", "data": await asyncio.to_thread(
+                self.manager.list_users_scoped, data.get("tenant_slug"))}
+
+        if normalized_cmd == "LDAP_LIST_GROUPS":
+            return {"status": "SUCCESS", "data": await asyncio.to_thread(
+                self.manager.list_groups_scoped, data.get("tenant_slug"))}
+
+        if normalized_cmd == "LDAP_GET_USER_GROUPS":
+            return await asyncio.to_thread(
+                self.manager.get_user_groups,
+                data.get("uid"), data.get("tenant_slug"))
 
         if normalized_cmd == "INSTALL_CERT":
             # Hub-brokered Let's Encrypt cert install. The le spoke issued/
@@ -304,3 +387,93 @@ class LdapSpoke(BaseSpoke):
         if proc.returncode != 0:
             err = stderr.decode().strip() or f"systemctl exited {proc.returncode}"
             raise _CertInstallError(f"slapd restart failed: {err[:300]}")
+
+    # ── UPDATE_CONFIG re-apply helpers (Entra .env + mirror-mode) ──────────
+
+    # Keys persisted to .env so the standalone pam_exec ROPC bridge (which reads
+    # .env, not this process's memory) sees Entra config pushed via UPDATE_CONFIG.
+    _ENV_PERSIST_KEYS = (
+        "ENTRA_TENANT_ID", "ENTRA_CLIENT_ID", "ENTRA_CLIENT_CERT",
+        "ENTRA_CLIENT_KEY", "ENTRA_ROPC_SCOPE", "LDAP_BASE_DN",
+        "LDAP_ADMIN_DN", "LDAP_SERVER_ID", "LDAP_MIRROR_PEERS",
+    )
+
+    def _env_path(self) -> str:
+        return os.environ.get("LDAP_ENV_PATH") or str(Path(__file__).parent.parent / ".env")
+
+    def _persist_env(self, data: Dict[str, Any]) -> None:
+        """Merge the persist-worthy keys from ``data`` into the module ``.env``
+        (preserving all other lines), then re-chmod 0600. Only keys present in
+        ``data`` are updated; ``LDAP_MIRROR_PEERS`` is JSON-serialised if a list."""
+        path = self._env_path()
+        updates = {}
+        for k in self._ENV_PERSIST_KEYS:
+            if k in data and data[k] is not None:
+                v = data[k]
+                if k == "LDAP_MIRROR_PEERS" and isinstance(v, (list, tuple)):
+                    v = json.dumps(list(v))
+                updates[k] = str(v)
+        if not updates:
+            return
+        lines = []
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+        seen = set()
+        out = []
+        for line in lines:
+            key = line.split("=", 1)[0].strip() if "=" in line else ""
+            if key in updates:
+                out.append(f"{key}={updates[key]}")
+                seen.add(key)
+            else:
+                out.append(line)
+        for k, v in updates.items():
+            if k not in seen:
+                out.append(f"{k}={v}")
+        tmp = f"{path}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write("\n".join(out) + "\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+
+    async def _ldapmodify_tolerant(self, ldif: str, tolerate: str = "") -> Optional[str]:
+        """Like ``_ldapmodify`` but returns an error string instead of raising,
+        and treats an error whose text contains ``tolerate`` (e.g. "already
+        exists") as success (returns None)."""
+        try:
+            await self._ldapmodify(ldif)
+            return None
+        except _CertInstallError as e:
+            msg = str(e)
+            if tolerate and tolerate.lower() in msg.lower():
+                return None
+            return msg
+
+    async def _apply_replication_config(self, data: Dict[str, Any]) -> str:
+        """Re-apply syncrepl mirror-mode to cn=config idempotently (best-effort;
+        requires co-location on the slapd host as root via ldapi EXTERNAL).
+        Returns a short human-readable note for the UPDATE_CONFIG response."""
+        try:
+            server_id = int(data.get("LDAP_SERVER_ID"))
+            peers = data.get("LDAP_MIRROR_PEERS")
+            if isinstance(peers, str):
+                peers = json.loads(peers) if peers.strip().startswith("[") else [peers]
+            base_dn = data.get("LDAP_BASE_DN", "")
+            admin_dn = data.get("LDAP_ADMIN_DN", "")
+            admin_pw = data.get("LDAP_ADMIN_PW", "")
+            overlay = replication.build_syncprov_overlay_ldif()
+            mirror = replication.build_full_mirror_ldif(
+                server_id, peers, base_dn, admin_dn, admin_pw)
+        except (ValueError, TypeError, json.JSONDecodeError) as e:
+            return f"replication config invalid: {str(e)[:120]}"
+        # syncprov overlay: tolerate "already exists" so re-runs are idempotent.
+        err = await self._ldapmodify_tolerant(overlay, tolerate="already exists")
+        if err:
+            return f"replication syncprov apply failed: {err[:160]}"
+        err = await self._ldapmodify_tolerant(mirror)
+        if err:
+            return f"replication mirror apply failed: {err[:160]}"
+        logger.info("UPDATE_CONFIG: mirror-mode replication re-applied (serverID=%s)", server_id)
+        return "mirror-mode replication re-applied"

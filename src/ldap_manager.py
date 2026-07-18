@@ -9,7 +9,22 @@ import os
 import secrets
 from contextlib import contextmanager
 
+# Pure DN builders (dependency-free) — shared, tested tenant-scoped DN math.
+try:
+    from .ldap_dn import (canonical_slug, tenant_ou_dn, users_container_dn,
+                          groups_container_dn, user_dn as build_user_dn,
+                          group_dn as build_group_dn)
+except ImportError:  # loaded outside the src package (tests / bare import)
+    from ldap_dn import (canonical_slug, tenant_ou_dn, users_container_dn,
+                         groups_container_dn, user_dn as build_user_dn,
+                         group_dn as build_group_dn)
+
 logger = logging.getLogger("LdapManager")
+
+# userPassword marker that routes a bind through Cyrus SASL → saslauthd → the
+# Entra ROPC bridge (see src/entra_ropc_auth.py). An Entra-backed user's
+# userPassword is ``{SASL}<upn>`` — it carries no local secret.
+SASL_SCHEME = "{SASL}"
 
 class LdapManager:
     """Synchronous LDAP CRUD wrapper over ``python-ldap``.
@@ -252,6 +267,297 @@ class LdapManager:
         return {"status": status, "moved": moved, "count": len(moved), "errors": errors,
                 "message": (f"moved {len(moved)} entry(ies) to '{target_base_dn}'"
                             + (f", {len(errors)} error(s)" if errors else ""))}
+
+    # ── Tenant-scoped operations (TENANT == OU, 1:1) ───────────────────────
+    # A tenant's entries live under ou=<slug>,<base> with child ou=users /
+    # ou=groups. The slug is canonical-lower-cased (ldap_dn.canonical_slug) so
+    # the tenant identity is CASE-INSENSITIVE and shared across LM/NetBox/LDAP
+    # ("LRB" == "lrb"). All DN construction goes through the tested pure helpers.
+
+    def _ensure_entry(self, conn, dn: str, attrs: Dict[str, Any]) -> None:
+        """Add ``dn`` if absent; treat ALREADY_EXISTS as success (idempotent)."""
+        try:
+            conn.add_s(dn, attrs)
+        except ldap.ALREADY_EXISTS:
+            pass
+
+    def _find_tenant_ou(self, conn, slug: str) -> Optional[str]:
+        """Return the DN of an existing tenant OU for ``slug`` (case-insensitive),
+        or None. ``ou`` uses caseIgnoreMatch, so a filter on the canonical slug
+        matches an OU stored in ANY case ("LRB" finds "lrb")."""
+        safe = ldap.filter.escape_filter_chars(slug)
+        try:
+            res = conn.search_s(self.base_dn, ldap.SCOPE_ONELEVEL,
+                                f"(&(objectClass=organizationalUnit)(ou={safe}))", ['ou'])
+        except ldap.NO_SUCH_OBJECT:
+            return None
+        for dn, _attrs in res:
+            if dn:
+                return dn
+        return None
+
+    def provision_tenant_ou(self, tenant_slug: str) -> Dict[str, Any]:
+        """Idempotently create ``ou=<slug>,<base>`` + child ``ou=users`` /
+        ``ou=groups``. Case-insensitive: if an OU already exists for this tenant
+        in ANY case, reuse it (never create a second). Returns the OU DN."""
+        try:
+            slug = canonical_slug(tenant_slug)
+        except ValueError as e:
+            return {"status": "ERROR", "message": str(e)}
+        try:
+            with self._conn() as conn:
+                existing = self._find_tenant_ou(conn, slug)
+                ou_dn = existing or tenant_ou_dn(self.base_dn, slug)
+                if not existing:
+                    self._ensure_entry(conn, ou_dn, {
+                        'objectClass': [b'organizationalUnit'],
+                        'ou': [slug.encode('utf-8')],
+                    })
+                # Child containers (idempotent whether the OU is new or reused).
+                for child in (users_container_dn(self.base_dn, slug),
+                              groups_container_dn(self.base_dn, slug)):
+                    child_ou = child.split(',', 1)[0].split('=', 1)[1]
+                    self._ensure_entry(conn, child, {
+                        'objectClass': [b'organizationalUnit'],
+                        'ou': [child_ou.encode('utf-8')],
+                    })
+            return {"status": "SUCCESS", "dn": ou_dn}
+        except ldap.LDAPError as e:
+            logger.error(f"Error provisioning tenant OU '{tenant_slug}': {e}")
+            return {"status": "ERROR", "message": str(e)}
+
+    def create_user_scoped(self, uid: str, attrs: Optional[Dict[str, Any]] = None,
+                           tenant_slug: Optional[str] = None,
+                           auth_mode: str = "local", upn: Optional[str] = None,
+                           password: Optional[str] = None) -> Dict[str, Any]:
+        """Create a user under a tenant's ``ou=users`` (or base level if no slug).
+
+        ``auth_mode="entra"`` → ``userPassword: {SASL}<upn>`` (no local secret;
+        binds are validated against Entra via the ROPC bridge); ``"local"`` →
+        ``{SSHA}`` of ``password`` (generated if omitted, returned once)."""
+        attrs = attrs or {}
+        try:
+            dn = build_user_dn(self.base_dn, uid, tenant_slug)
+        except ValueError as e:
+            return {"status": "ERROR", "message": str(e)}
+        cn = attrs.get('cn') or attrs.get('mail') or uid
+        sn = attrs.get('sn') or attrs.get('cn') or uid
+        entry: Dict[str, Any] = {
+            'objectClass': [b'top', b'person', b'organizationalPerson', b'inetOrgPerson'],
+            'cn': [str(cn).encode('utf-8')],
+            'sn': [str(sn).encode('utf-8')],
+            'uid': [uid.encode('utf-8')],
+        }
+        for opt in ('givenName', 'mail', 'displayName', 'telephoneNumber', 'title'):
+            if attrs.get(opt):
+                entry[opt] = [str(attrs[opt]).encode('utf-8')]
+        result_pw = None
+        if auth_mode == "entra":
+            entra_upn = upn or attrs.get('mail') or uid
+            # {SASL}<upn> routes binds to saslauthd → Entra ROPC; no local pw.
+            entry['userPassword'] = [f"{SASL_SCHEME}{entra_upn}".encode('utf-8')]
+        else:
+            result_pw = password or secrets.token_urlsafe(16)
+            entry['userPassword'] = [self._ssha(result_pw)]
+        try:
+            with self._conn() as conn:
+                conn.add_s(dn, entry)
+            out = {"status": "SUCCESS", "dn": dn, "auth_mode": auth_mode}
+            if result_pw is not None:
+                out["password"] = result_pw
+            return out
+        except ldap.LDAPError as e:
+            logger.error(f"Error creating user {dn}: {e}")
+            return {"status": "ERROR", "message": str(e)}
+
+    def update_user_scoped(self, uid: str, attrs: Optional[Dict[str, Any]] = None,
+                           tenant_slug: Optional[str] = None) -> Dict[str, Any]:
+        """Replace supplied attributes on a tenant-scoped user (cn/sn/givenName/
+        mail/displayName/...). Does not touch userPassword or the auth mode."""
+        attrs = attrs or {}
+        try:
+            dn = build_user_dn(self.base_dn, uid, tenant_slug)
+        except ValueError as e:
+            return {"status": "ERROR", "message": str(e)}
+        mods = []
+        for key in ('cn', 'sn', 'givenName', 'mail', 'displayName',
+                    'telephoneNumber', 'title'):
+            if key in attrs and attrs[key] is not None:
+                mods.append((ldap.MOD_REPLACE, key, [str(attrs[key]).encode('utf-8')]))
+        if not mods:
+            return {"status": "SUCCESS", "dn": dn, "message": "no attributes to update"}
+        try:
+            with self._conn() as conn:
+                conn.modify_s(dn, mods)
+            return {"status": "SUCCESS", "dn": dn}
+        except ldap.LDAPError as e:
+            logger.error(f"Error updating user {dn}: {e}")
+            return {"status": "ERROR", "message": str(e)}
+
+    def delete_user_scoped(self, uid: str, tenant_slug: Optional[str] = None) -> Dict[str, Any]:
+        """Delete a tenant-scoped user by uid."""
+        try:
+            dn = build_user_dn(self.base_dn, uid, tenant_slug)
+        except ValueError as e:
+            return {"status": "ERROR", "message": str(e)}
+        return self.delete_entity(dn)
+
+    def set_password_scoped(self, uid: str, new_password: str,
+                            tenant_slug: Optional[str] = None) -> Dict[str, Any]:
+        """Set a LOCAL user's password. Refuses Entra-backed users (their
+        userPassword is ``{SASL}<upn>`` — they have no local secret to set)."""
+        if not new_password:
+            return {"status": "ERROR", "message": "password is required"}
+        try:
+            dn = build_user_dn(self.base_dn, uid, tenant_slug)
+        except ValueError as e:
+            return {"status": "ERROR", "message": str(e)}
+        try:
+            with self._conn() as conn:
+                cur = conn.search_s(dn, ldap.SCOPE_BASE, "(objectClass=*)", ['userPassword'])
+                for _d, a in cur:
+                    for val in a.get('userPassword', []):
+                        if val.decode('utf-8', 'replace').startswith(SASL_SCHEME):
+                            return {"status": "ERROR",
+                                    "message": "user is Entra-backed (SASL); has no "
+                                               "local password to set"}
+                conn.modify_s(dn, [(ldap.MOD_REPLACE, 'userPassword', [self._ssha(new_password)])])
+            return {"status": "SUCCESS", "dn": dn}
+        except ldap.LDAPError as e:
+            logger.error(f"Error setting password for {dn}: {e}")
+            return {"status": "ERROR", "message": str(e)}
+
+    def create_group_scoped(self, cn: str, tenant_slug: Optional[str] = None) -> Dict[str, Any]:
+        """Create a ``groupOfNames`` under a tenant's ``ou=groups``. Seeded with
+        the base DN as a placeholder member (groupOfNames requires ≥1)."""
+        try:
+            dn = build_group_dn(self.base_dn, cn, tenant_slug)
+        except ValueError as e:
+            return {"status": "ERROR", "message": str(e)}
+        try:
+            with self._conn() as conn:
+                conn.add_s(dn, {
+                    'objectClass': [b'groupOfNames'],
+                    'cn': [cn.encode('utf-8')],
+                    'member': [self.base_dn.encode('utf-8')],
+                })
+            return {"status": "SUCCESS", "dn": dn}
+        except ldap.LDAPError as e:
+            logger.error(f"Error creating group {dn}: {e}")
+            return {"status": "ERROR", "message": str(e)}
+
+    def add_member_scoped(self, uid: str, group_cn: str,
+                          tenant_slug: Optional[str] = None) -> Dict[str, Any]:
+        """Add a tenant-scoped user to a tenant-scoped group."""
+        try:
+            u_dn = build_user_dn(self.base_dn, uid, tenant_slug)
+            g_dn = build_group_dn(self.base_dn, group_cn, tenant_slug)
+        except ValueError as e:
+            return {"status": "ERROR", "message": str(e)}
+        return self.add_user_to_group(u_dn, g_dn)
+
+    def remove_member_scoped(self, uid: str, group_cn: str,
+                             tenant_slug: Optional[str] = None) -> Dict[str, Any]:
+        """Remove a tenant-scoped user from a tenant-scoped group."""
+        try:
+            u_dn = build_user_dn(self.base_dn, uid, tenant_slug)
+            g_dn = build_group_dn(self.base_dn, group_cn, tenant_slug)
+        except ValueError as e:
+            return {"status": "ERROR", "message": str(e)}
+        return self.remove_user_from_group(u_dn, g_dn)
+
+    def list_users_scoped(self, tenant_slug: Optional[str] = None) -> List[Dict[str, Any]]:
+        """List users under a tenant's ``ou=users`` (or base level if no slug)."""
+        try:
+            search_base = users_container_dn(self.base_dn, tenant_slug)
+        except ValueError:
+            return []
+        try:
+            with self._conn() as conn:
+                results = conn.search_s(search_base, ldap.SCOPE_SUBTREE,
+                                        "(objectClass=person)",
+                                        ['uid', 'cn', 'sn', 'givenName', 'mail', 'userPassword'])
+        except ldap.NO_SUCH_OBJECT:
+            return []
+        users = []
+        for dn, attrs in results:
+            if not dn:
+                continue
+            def _d(k):
+                v = attrs.get(k, [b''])
+                return v[0].decode('utf-8', 'replace') if v and v[0] else ''
+            pw = attrs.get('userPassword', [b''])
+            is_entra = bool(pw and pw[0].decode('utf-8', 'replace').startswith(SASL_SCHEME))
+            users.append({
+                "username": _d('uid') or dn.split(',')[0].split('=')[-1],
+                "cn": _d('cn'), "first_name": _d('givenName'),
+                "last_name": _d('sn'), "email": _d('mail'), "dn": dn,
+                "auth_mode": "entra" if is_entra else "local",
+            })
+        return users
+
+    def list_groups_scoped(self, tenant_slug: Optional[str] = None) -> List[Dict[str, Any]]:
+        """List groups under a tenant's ``ou=groups`` (or base level if no slug)."""
+        try:
+            search_base = groups_container_dn(self.base_dn, tenant_slug)
+        except ValueError:
+            return []
+        try:
+            with self._conn() as conn:
+                results = conn.search_s(search_base, ldap.SCOPE_SUBTREE,
+                                        "(|(objectClass=groupOfNames)(objectClass=posixGroup))",
+                                        ['cn', 'member', 'memberUid'])
+        except ldap.NO_SUCH_OBJECT:
+            return []
+        groups = []
+        for dn, attrs in results:
+            if not dn:
+                continue
+            cn = attrs.get('cn', [b''])[0].decode('utf-8', 'replace') if attrs.get('cn') else ''
+            members = [m.decode('utf-8', 'replace') for m in attrs.get('member', [])
+                       if m.decode('utf-8', 'replace') != self.base_dn]
+            groups.append({"name": cn, "dn": dn, "member_count": len(members),
+                           "members": members})
+        return groups
+
+    def get_user_groups(self, uid: str, tenant_slug: Optional[str] = None) -> Dict[str, Any]:
+        """Return a user's group memberships — for hub RBAC. Reads the user's
+        ``memberOf`` (if the memberof overlay is enabled) AND searches groups by
+        ``member=<user_dn>`` (works without the overlay); the union is returned."""
+        try:
+            u_dn = build_user_dn(self.base_dn, uid, tenant_slug)
+            groups_base = groups_container_dn(self.base_dn, tenant_slug)
+        except ValueError as e:
+            return {"status": "ERROR", "message": str(e)}
+        found: Dict[str, str] = {}  # dn -> cn
+        try:
+            with self._conn() as conn:
+                # memberOf on the user entry (present only with the memberof overlay).
+                try:
+                    ures = conn.search_s(u_dn, ldap.SCOPE_BASE, "(objectClass=*)", ['memberOf'])
+                    for _d, a in ures:
+                        for g in a.get('memberOf', []):
+                            found.setdefault(g.decode('utf-8', 'replace'), '')
+                except ldap.NO_SUCH_OBJECT:
+                    return {"status": "ERROR", "message": f"user not found: {u_dn}"}
+                # Reverse search: groups that list this user as a member.
+                safe = ldap.filter.escape_filter_chars(u_dn)
+                try:
+                    gres = conn.search_s(groups_base, ldap.SCOPE_SUBTREE,
+                                         f"(&(objectClass=groupOfNames)(member={safe}))", ['cn'])
+                    for gdn, a in gres:
+                        if gdn:
+                            cn = a.get('cn', [b''])[0].decode('utf-8', 'replace') if a.get('cn') else ''
+                            found[gdn] = cn or found.get(gdn, '')
+                except ldap.NO_SUCH_OBJECT:
+                    pass
+        except ldap.LDAPError as e:
+            logger.error(f"Error getting groups for {u_dn}: {e}")
+            return {"status": "ERROR", "message": str(e)}
+        groups = [{"dn": dn, "name": cn or dn.split(',')[0].split('=')[-1]}
+                  for dn, cn in found.items()]
+        return {"status": "SUCCESS", "dn": u_dn, "groups": groups,
+                "group_dns": list(found.keys()), "count": len(groups)}
 
     def update_ou(self, dn: str, new_name: str) -> Dict[str, Any]:
         """Rename an OU. The new DN is derived from the new ou= RDN."""
