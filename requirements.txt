@@ -7,3 +7,7 @@ ldap3
 fastapi
 uvicorn
 gitpython
+# Entra ROPC pass-through (src/entra_ropc_auth.py): cert-based client_assertion
+# JWT signing (cryptography + PyJWT) + token request (requests, above).
+cryptography
+PyJWT
