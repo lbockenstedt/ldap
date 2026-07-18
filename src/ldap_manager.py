@@ -446,6 +446,14 @@ class LdapManager:
             logger.error(f"Error creating group {dn}: {e}")
             return {"status": "ERROR", "message": str(e)}
 
+    def delete_group_scoped(self, cn: str, tenant_slug: Optional[str] = None) -> Dict[str, Any]:
+        """Delete a tenant-scoped group by cn (under the tenant's ou=groups)."""
+        try:
+            dn = build_group_dn(self.base_dn, cn, tenant_slug)
+        except ValueError as e:
+            return {"status": "ERROR", "message": str(e)}
+        return self.delete_entity(dn)
+
     def add_member_scoped(self, uid: str, group_cn: str,
                           tenant_slug: Optional[str] = None) -> Dict[str, Any]:
         """Add a tenant-scoped user to a tenant-scoped group."""

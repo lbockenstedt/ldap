@@ -180,6 +180,12 @@ class LdapSpoke(BaseSpoke):
                 self.manager.create_group_scoped,
                 data.get("cn") or data.get("name"), data.get("tenant_slug"))
 
+        if normalized_cmd == "LDAP_DELETE_GROUP":
+            return await asyncio.to_thread(
+                self.manager.delete_group_scoped,
+                data.get("cn") or data.get("group") or data.get("name"),
+                data.get("tenant_slug"))
+
         if normalized_cmd == "LDAP_ADD_MEMBER":
             return await asyncio.to_thread(
                 self.manager.add_member_scoped,
