@@ -1,21 +1,21 @@
-# Base Organizational Units
-dn: ou=People,dc=EXAMPLE,dc=COM
-ou: People
+# Base directory structure — applied automatically by install_ldap.sh --infra-only.
+#
+# The token below (two '@' + BASE_DN + two '@') is substituted with the ONE
+# canonical base DN chosen at install (--base-dn, or derived from the host
+# domain) by src/ldif_template.py, then applied idempotently. Do NOT hard-code
+# a literal DN here.
+#
+# These are the base-level (no-tenant) containers. Per-tenant structure
+# (a tenant OU with its own ou=users / ou=groups) is created on demand by the
+# LDAP_PROVISION_TENANT_OU command, not seeded here.
+#
+# No example/seed user is created (an auto-applied cleartext password would be a
+# credential left at rest); create users via the LDAP_CREATE_USER command.
+
+dn: ou=users,@@BASE_DN@@
+ou: users
 objectClass: organizationalUnit
 
-dn: ou=Groups,dc=EXAMPLE,dc=COM
-ou: Groups
+dn: ou=groups,@@BASE_DN@@
+ou: groups
 objectClass: organizationalUnit
-
-# Example User
-dn: cn=admin_user,ou=People,dc=EXAMPLE,dc=COM
-cn: admin_user
-sn: User
-objectClass: inetOrgPerson
-objectClass: posixAccount
-uid: admin_user
-uidNumber: 1000
-gidNumber: 1000
-homeDirectory: /home/admin_user
-loginShell: /bin/bash
-userPassword: password123
