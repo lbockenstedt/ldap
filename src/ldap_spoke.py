@@ -6,6 +6,7 @@ import re
 import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+import ldap
 try:
     from base_spoke import BaseSpoke
 except ImportError:
@@ -36,6 +37,35 @@ class LdapSpoke(BaseSpoke):
             base_dn=self.config.get("LDAP_BASE_DN", "dc=example,dc=org"),
             server_url=self.config.get("LDAP_SERVER_URL", "ldap://localhost:389")
         )
+
+    def _ldap_error_envelope(self, exc: Exception) -> Dict[str, Any]:
+        """Map an ``ldap.LDAPError`` to a clean ERROR envelope.
+
+        The list/read handlers below used to let ``LDAPError`` propagate; the
+        control plane catches it (``control_plane.py``) but via
+        ``logger.exception``, which dumps a 30-line traceback PER CALL into the
+        spoke log — so a stale admin password (bind result 49) spammed the log
+        on every LIST_OUS / LDAP_LIST_USERS poll. Returning a clean envelope
+        here keeps the log to one line and gives the operator a targeted hint
+        for the common bind failure instead of a raw ``INVALID_CREDENTIALS``
+        traceback. The write handlers already catch ``LDAPError`` inside the
+        manager methods, so this is only needed for the list/read path."""
+        if isinstance(exc, ldap.INVALID_CREDENTIALS):
+            return {"status": "ERROR", "error": "INVALID_CREDENTIALS",
+                    "message": "LDAP bind failed: invalid credentials — the "
+                               "LDAP_ADMIN_PW in this spoke's config does not "
+                               "match slapd's admin password. Re-push the correct "
+                               "password via Setup → LDAP (UPDATE_CONFIG)."}
+        return {"status": "ERROR", "message": f"{type(exc).__name__}: {exc}"}
+
+    async def _ldap_list(self, fn, *args) -> Dict[str, Any]:
+        """Run a list/read manager call in a worker thread; on ``LDAPError``
+        return a clean ERROR envelope instead of raising (avoids the per-call
+        traceback dump from the control plane's ``logger.exception`` path)."""
+        try:
+            return {"status": "SUCCESS", "data": await asyncio.to_thread(fn, *args)}
+        except ldap.LDAPError as exc:
+            return self._ldap_error_envelope(exc)
 
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """Dispatch a hub command to the matching ``LdapManager`` method.
@@ -89,7 +119,7 @@ class LdapSpoke(BaseSpoke):
         # asyncio event loop, which would freeze this spoke's heartbeats and get it
         # disconnected by the hub (and queue every other command behind it).
         if normalized_cmd == "LIST_OUS":
-            return {"status": "SUCCESS", "data": await asyncio.to_thread(self.manager.list_ous)}
+            return await self._ldap_list(self.manager.list_ous)
 
         if normalized_cmd == "CREATE_OU":
             return await asyncio.to_thread(self.manager.create_ou, data.get("name"), data.get("parent_dn"))
@@ -98,7 +128,7 @@ class LdapSpoke(BaseSpoke):
             return await asyncio.to_thread(self.manager.update_ou, data.get("dn"), data.get("name"))
 
         if normalized_cmd == "LIST_USERS":
-            return {"status": "SUCCESS", "data": await asyncio.to_thread(self.manager.list_users)}
+            return await self._ldap_list(self.manager.list_users)
 
         if normalized_cmd == "CREATE_USER":
             return await asyncio.to_thread(
@@ -113,7 +143,7 @@ class LdapSpoke(BaseSpoke):
                 data.get("email"), data.get("username"))
 
         if normalized_cmd == "LIST_GROUPS":
-            return {"status": "SUCCESS", "data": await asyncio.to_thread(self.manager.list_groups)}
+            return await self._ldap_list(self.manager.list_groups)
 
         if normalized_cmd == "CREATE_GROUP":
             return await asyncio.to_thread(self.manager.create_group, data.get("name"), data.get("ou_dn"))
@@ -199,12 +229,10 @@ class LdapSpoke(BaseSpoke):
                 data.get("tenant_slug"))
 
         if normalized_cmd == "LDAP_LIST_USERS":
-            return {"status": "SUCCESS", "data": await asyncio.to_thread(
-                self.manager.list_users_scoped, data.get("tenant_slug"))}
+            return await self._ldap_list(self.manager.list_users_scoped, data.get("tenant_slug"))
 
         if normalized_cmd == "LDAP_LIST_GROUPS":
-            return {"status": "SUCCESS", "data": await asyncio.to_thread(
-                self.manager.list_groups_scoped, data.get("tenant_slug"))}
+            return await self._ldap_list(self.manager.list_groups_scoped, data.get("tenant_slug"))
 
         if normalized_cmd == "LDAP_GET_USER_GROUPS":
             return await asyncio.to_thread(
