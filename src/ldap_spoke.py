@@ -12,7 +12,7 @@ try:
 except ImportError:
     from core.src.base_spoke import BaseSpoke
 
-from .ldap_manager import LdapManager
+from .ldap_manager import LdapManager, LdapBindError
 try:
     from . import replication
 except ImportError:  # loaded outside the src package
@@ -39,7 +39,8 @@ class LdapSpoke(BaseSpoke):
         )
 
     def _ldap_error_envelope(self, exc: Exception) -> Dict[str, Any]:
-        """Map an ``ldap.LDAPError`` to a clean ERROR envelope.
+        """Map an ``ldap.LDAPError`` / :class:`LdapBindError` to a clean ERROR
+        envelope.
 
         The list/read handlers below used to let ``LDAPError`` propagate; the
         control plane catches it (``control_plane.py``) but via
@@ -48,23 +49,57 @@ class LdapSpoke(BaseSpoke):
         on every LIST_OUS / LDAP_LIST_USERS poll. Returning a clean envelope
         here keeps the log to one line and gives the operator a targeted hint
         for the common bind failure instead of a raw ``INVALID_CREDENTIALS``
-        traceback. The write handlers already catch ``LDAPError`` inside the
-        manager methods, so this is only needed for the list/read path."""
+        traceback. The write handlers route through :meth:`_ldap_write`, which
+        catches a propagating :class:`LdapBindError` (the manager raises it on
+        bind failure instead of letting the cryptic dict get logged/returned
+        per-method) here too."""
         if isinstance(exc, ldap.INVALID_CREDENTIALS):
+            msg = ("LDAP bind failed: invalid credentials — the LDAP_ADMIN_PW "
+                   "in this spoke's config does not match slapd's admin "
+                   "password. Re-push the correct password via Setup → LDAP "
+                   "(UPDATE_CONFIG).")
+            logger.warning("LDAP bind failed (invalid credentials): %s", msg)
             return {"status": "ERROR", "error": "INVALID_CREDENTIALS",
-                    "message": "LDAP bind failed: invalid credentials — the "
-                               "LDAP_ADMIN_PW in this spoke's config does not "
-                               "match slapd's admin password. Re-push the correct "
-                               "password via Setup → LDAP (UPDATE_CONFIG)."}
+                    "message": msg}
+        if isinstance(exc, LdapBindError):
+            # The manager already formatted the actionable message; surface it
+            # verbatim + log one WARNING line (replaces the per-method cryptic
+            # ``LdapManager - ERROR - Error creating user … {dict}`` line).
+            logger.warning("LDAP bind failed: %s", exc)
+            return {"status": "ERROR", "error": "INVALID_CREDENTIALS",
+                    "message": str(exc)}
         return {"status": "ERROR", "message": f"{type(exc).__name__}: {exc}"}
 
     async def _ldap_list(self, fn, *args) -> Dict[str, Any]:
-        """Run a list/read manager call in a worker thread; on ``LDAPError``
-        return a clean ERROR envelope instead of raising (avoids the per-call
-        traceback dump from the control plane's ``logger.exception`` path)."""
+        """Run a list/read manager call in a worker thread; on ``LDAPError`` /
+        :class:`LdapBindError` return a clean ERROR envelope instead of raising
+        (avoids the per-call traceback dump from the control plane's
+        ``logger.exception`` path)."""
         try:
             return {"status": "SUCCESS", "data": await asyncio.to_thread(fn, *args)}
-        except ldap.LDAPError as exc:
+        except (ldap.LDAPError, LdapBindError) as exc:
+            return self._ldap_error_envelope(exc)
+
+    async def _ldap_write(self, fn, *args) -> Dict[str, Any]:
+        """Run a write manager call in a worker thread; on a propagating
+        ``LDAPError`` / :class:`LdapBindError` return a clean ERROR envelope.
+
+        The manager's write methods catch ``ldap.LDAPError`` around the
+        operation (``add_s`` / ``modify_s`` / …) and return
+        ``{status:ERROR, message:str(e)}`` — those are legit per-operation
+        errors (e.g. ``ALREADY_EXISTS``) and pass through unchanged. A bind
+        failure is different: :meth:`LdapManager._bind` raises
+        :class:`LdapBindError` (NOT an ``LDAPError``), which bypasses those
+        per-method catches and propagates here — so a stale admin password
+        surfaces as the targeted ``INVALID_CREDENTIALS`` envelope (with the
+        re-push hint) instead of the raw ``{'result':49,…}`` dict or a
+        control-plane traceback. This covers both the ``_conn()``-based scoped
+        methods (bind inside the try) and the legacy ``_get_connection()``
+        methods (bind outside the try, which used to propagate as a
+        traceback)."""
+        try:
+            return await asyncio.to_thread(fn, *args)
+        except (ldap.LDAPError, LdapBindError) as exc:
             return self._ldap_error_envelope(exc)
 
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -122,22 +157,22 @@ class LdapSpoke(BaseSpoke):
             return await self._ldap_list(self.manager.list_ous)
 
         if normalized_cmd == "CREATE_OU":
-            return await asyncio.to_thread(self.manager.create_ou, data.get("name"), data.get("parent_dn"))
+            return await self._ldap_write(self.manager.create_ou, data.get("name"), data.get("parent_dn"))
 
         if normalized_cmd == "UPDATE_OU":
-            return await asyncio.to_thread(self.manager.update_ou, data.get("dn"), data.get("name"))
+            return await self._ldap_write(self.manager.update_ou, data.get("dn"), data.get("name"))
 
         if normalized_cmd == "LIST_USERS":
             return await self._ldap_list(self.manager.list_users)
 
         if normalized_cmd == "CREATE_USER":
-            return await asyncio.to_thread(
+            return await self._ldap_write(
                 self.manager.create_user,
                 data.get("username"), data.get("first_name"), data.get("last_name"),
                 data.get("email"), data.get("ou_dn"), data.get("password"))
 
         if normalized_cmd == "UPDATE_USER":
-            return await asyncio.to_thread(
+            return await self._ldap_write(
                 self.manager.update_user,
                 data.get("dn"), data.get("first_name"), data.get("last_name"),
                 data.get("email"), data.get("username"))
@@ -146,34 +181,34 @@ class LdapSpoke(BaseSpoke):
             return await self._ldap_list(self.manager.list_groups)
 
         if normalized_cmd == "CREATE_GROUP":
-            return await asyncio.to_thread(self.manager.create_group, data.get("name"), data.get("ou_dn"))
+            return await self._ldap_write(self.manager.create_group, data.get("name"), data.get("ou_dn"))
 
         if normalized_cmd == "UPDATE_GROUP":
-            return await asyncio.to_thread(self.manager.update_group, data.get("dn"), data.get("name"))
+            return await self._ldap_write(self.manager.update_group, data.get("dn"), data.get("name"))
 
         if normalized_cmd == "ADD_USER_TO_GROUP":
-            return await asyncio.to_thread(self.manager.add_user_to_group, data.get("user_dn"), data.get("group_dn"))
+            return await self._ldap_write(self.manager.add_user_to_group, data.get("user_dn"), data.get("group_dn"))
 
         if normalized_cmd == "REMOVE_USER_FROM_GROUP":
-            return await asyncio.to_thread(self.manager.remove_user_from_group, data.get("user_dn"), data.get("group_dn"))
+            return await self._ldap_write(self.manager.remove_user_from_group, data.get("user_dn"), data.get("group_dn"))
 
         if normalized_cmd == "SET_PASSWORD":
             user_dn = data.get("user_dn") or data.get("dn")
             password = data.get("password") or data.get("new_password")
             if not user_dn or not password:
                 return {"status": "ERROR", "message": "Missing user_dn or password"}
-            return await asyncio.to_thread(self.manager.set_password, user_dn, password)
+            return await self._ldap_write(self.manager.set_password, user_dn, password)
 
         if normalized_cmd == "DELETE_ENTITY":
-            return await asyncio.to_thread(self.manager.delete_entity, data.get("dn"))
+            return await self._ldap_write(self.manager.delete_entity, data.get("dn"))
 
         if normalized_cmd == "SEARCH_USERS":
-            return await asyncio.to_thread(self.manager.search, data.get("q", ""))
+            return await self._ldap_write(self.manager.search, data.get("q", ""))
 
         if normalized_cmd == "LDAP_MIGRATE_TENANT":
             # Cross-tenant migration: re-home entries from source_base_dn to
             # target_base_dn (a tenant's ldap_base_dn changed).
-            return await asyncio.to_thread(
+            return await self._ldap_write(
                 self.manager.migrate_tenant,
                 data.get("source_base_dn", ""), data.get("target_base_dn", ""),
                 bool(data.get("purge_source", False)))
@@ -181,49 +216,49 @@ class LdapSpoke(BaseSpoke):
         # ── Tenant-scoped commands (LDAP_* contract; TENANT == OU 1:1) ─────
         # All accept an optional tenant_slug; absent = base level (back-compat).
         if normalized_cmd == "LDAP_PROVISION_TENANT_OU":
-            return await asyncio.to_thread(
+            return await self._ldap_write(
                 self.manager.provision_tenant_ou, data.get("tenant_slug"))
 
         if normalized_cmd == "LDAP_CREATE_USER":
-            return await asyncio.to_thread(
+            return await self._ldap_write(
                 self.manager.create_user_scoped,
                 data.get("uid"), data.get("attrs") or {}, data.get("tenant_slug"),
                 data.get("auth_mode", "local"), data.get("upn"), data.get("password"))
 
         if normalized_cmd == "LDAP_UPDATE_USER":
-            return await asyncio.to_thread(
+            return await self._ldap_write(
                 self.manager.update_user_scoped,
                 data.get("uid"), data.get("attrs") or {}, data.get("tenant_slug"))
 
         if normalized_cmd == "LDAP_DELETE_USER":
-            return await asyncio.to_thread(
+            return await self._ldap_write(
                 self.manager.delete_user_scoped,
                 data.get("uid"), data.get("tenant_slug"))
 
         if normalized_cmd == "LDAP_SET_PASSWORD":
-            return await asyncio.to_thread(
+            return await self._ldap_write(
                 self.manager.set_password_scoped,
                 data.get("uid"), data.get("password"), data.get("tenant_slug"))
 
         if normalized_cmd == "LDAP_CREATE_GROUP":
-            return await asyncio.to_thread(
+            return await self._ldap_write(
                 self.manager.create_group_scoped,
                 data.get("cn") or data.get("name"), data.get("tenant_slug"))
 
         if normalized_cmd == "LDAP_DELETE_GROUP":
-            return await asyncio.to_thread(
+            return await self._ldap_write(
                 self.manager.delete_group_scoped,
                 data.get("cn") or data.get("group") or data.get("name"),
                 data.get("tenant_slug"))
 
         if normalized_cmd == "LDAP_ADD_MEMBER":
-            return await asyncio.to_thread(
+            return await self._ldap_write(
                 self.manager.add_member_scoped,
                 data.get("uid"), data.get("group") or data.get("cn"),
                 data.get("tenant_slug"))
 
         if normalized_cmd == "LDAP_REMOVE_MEMBER":
-            return await asyncio.to_thread(
+            return await self._ldap_write(
                 self.manager.remove_member_scoped,
                 data.get("uid"), data.get("group") or data.get("cn"),
                 data.get("tenant_slug"))
@@ -235,7 +270,7 @@ class LdapSpoke(BaseSpoke):
             return await self._ldap_list(self.manager.list_groups_scoped, data.get("tenant_slug"))
 
         if normalized_cmd == "LDAP_GET_USER_GROUPS":
-            return await asyncio.to_thread(
+            return await self._ldap_write(
                 self.manager.get_user_groups,
                 data.get("uid"), data.get("tenant_slug"))
 
@@ -260,6 +295,9 @@ class LdapSpoke(BaseSpoke):
         """Reports LDAP server status."""
         try:
             # Leak-free connectivity check (binds + unbinds), off the event loop.
+            # NOTE: deliberately asyncio.to_thread (NOT _ldap_write) — a bind
+            # failure must RAISE here so this returns UNHEALTHY; _ldap_write would
+            # swallow the LdapBindError into an envelope and falsely report HEALTHY.
             await asyncio.to_thread(self.manager.check_connection)
             return {"status": "HEALTHY", "server": "OpenLDAP Online"}
         except Exception as e:

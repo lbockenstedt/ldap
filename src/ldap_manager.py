@@ -26,6 +26,22 @@ logger = logging.getLogger("LdapManager")
 # userPassword is ``{SASL}<upn>`` — it carries no local secret.
 SASL_SCHEME = "{SASL}"
 
+
+class LdapBindError(Exception):
+    """Raised by :meth:`LdapManager._bind` when the admin bind fails
+    (``INVALID_CREDENTIALS`` / result 49). Carries an actionable message — the
+    spoke's ``LDAP_ADMIN_PW`` doesn't match slapd's admin password — so callers
+    and the spoke log surface the fix instead of the raw
+    ``{'msgtype':97,'result':49,'desc':'Invalid credentials'}`` dict.
+
+    Deliberately NOT an ``ldap.LDAPError`` subclass: the per-method
+    ``except ldap.LDAPError`` blocks must NOT swallow a bind failure (they'd log
+    the cryptic dict and return it); a bind error propagates past them to the
+    spoke, which maps it to a clean ``INVALID_CREDENTIALS`` envelope. Operation
+    errors (``add_s`` / ``modify_s`` / …) are still ``ldap.LDAPError`` and stay
+    caught per-method as before."""
+
+
 class LdapManager:
     """Synchronous LDAP CRUD wrapper over ``python-ldap``.
 
@@ -47,8 +63,26 @@ class LdapManager:
 
     def _get_connection(self):
         conn = ldap.initialize(self.server)
-        conn.simple_bind_s(self.admin_dn, self.admin_pw)
+        self._bind(conn)
         return conn
+
+    def _bind(self, conn) -> None:
+        """Bind as the admin DN. On ``INVALID_CREDENTIALS`` (result 49) raise
+        :class:`LdapBindError` with an actionable message — the spoke's
+        ``LDAP_ADMIN_PW`` doesn't match slapd's admin password — instead of
+        letting the raw ``{'result':49,'desc':'Invalid credentials'}`` dict
+        propagate. Callers' ``except ldap.LDAPError`` blocks don't catch this
+        (it's not an ``LDAPError``), so a bind failure surfaces as a clean
+        ``INVALID_CREDENTIALS`` envelope at the spoke, not a cryptic per-method
+        log line or a control-plane traceback."""
+        try:
+            conn.simple_bind_s(self.admin_dn, self.admin_pw)
+        except ldap.INVALID_CREDENTIALS as exc:
+            raise LdapBindError(
+                "LDAP bind failed: invalid credentials — the LDAP_ADMIN_PW in "
+                "this spoke's config does not match slapd's admin password. "
+                "Re-push the correct password via Setup → LDAP (UPDATE_CONFIG)."
+            ) from exc
 
     @contextmanager
     def _conn(self):
@@ -57,7 +91,7 @@ class LdapManager:
         slapd's conn limit on a long-running spoke."""
         conn = ldap.initialize(self.server)
         try:
-            conn.simple_bind_s(self.admin_dn, self.admin_pw)
+            self._bind(conn)
             yield conn
         finally:
             try:

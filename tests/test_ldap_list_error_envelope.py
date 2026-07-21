@@ -19,6 +19,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 _PXMX_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, "/Users/lbockenstedt/vscode/lm/core/src")
 
@@ -55,6 +57,7 @@ spoke_mod = importlib.util.module_from_spec(_spec_s)
 sys.modules["ldap_src_pkg.ldap_spoke"] = spoke_mod
 _spec_s.loader.exec_module(spoke_mod)
 LdapSpoke = spoke_mod.LdapSpoke
+LdapBindError = _mgr.LdapBindError
 LDAPError = _ldap.LDAPError
 INVALID_CREDENTIALS = _ldap.INVALID_CREDENTIALS
 
@@ -135,3 +138,71 @@ def test_success_path_still_wraps_data():
     res = _run(sp.handle_command("LIST_OUS", {}))
     assert res["status"] == "SUCCESS"
     assert res["data"][0]["name"] == "users"
+
+
+# ── write path: a bind failure must surface as the targeted envelope ───────
+# The manager's _bind() raises LdapBindError (NOT an LDAPError) on
+# INVALID_CREDENTIALS so it bypasses the per-method `except ldap.LDAPError`
+# blocks (which used to log + return the raw {'result':49,…} dict). The spoke's
+# _ldap_write catches it and maps it to the clean INVALID_CREDENTIALS envelope.
+def test_write_bind_failure_returns_targeted_envelope():
+    sp = _spoke()
+
+    def _boom(*a, **k):
+        raise LdapBindError(
+            "LDAP bind failed: invalid credentials — the LDAP_ADMIN_PW in this "
+            "spoke's config does not match slapd's admin password. Re-push the "
+            "correct password via Setup → LDAP (UPDATE_CONFIG).")
+
+    sp.manager.create_user_scoped = _boom
+    res = _run(sp.handle_command("LDAP_CREATE_USER", {
+        "uid": "lance", "attrs": {"cn": "Lance", "sn": "B",
+                                  "mail": "l@x.org"},
+        "tenant_slug": "lrb", "auth_mode": "local"}))
+    assert res["status"] == "ERROR"
+    assert res["error"] == "INVALID_CREDENTIALS"
+    assert "LDAP_ADMIN_PW" in res["message"]
+    assert "UPDATE_CONFIG" in res["message"]
+
+
+def test_write_bind_failure_does_not_raise():
+    # The whole point: a bind failure on a write must NOT propagate (which
+    # would trigger the control plane's logger.exception traceback dump).
+    sp = _spoke()
+    sp.manager.create_group_scoped = lambda *a, **k: (_ for _ in ()).throw(
+        LdapBindError("bind failed"))
+    res = _run(sp.handle_command("LDAP_CREATE_GROUP",
+                                 {"cn": "admins", "tenant_slug": "lrb"}))
+    assert isinstance(res, dict) and res["status"] == "ERROR"
+    assert res["error"] == "INVALID_CREDENTIALS"
+
+
+def test_write_operation_error_passes_through_unchanged():
+    # A legit per-operation error (e.g. ALREADY_EXISTS) is caught inside the
+    # manager method and returned as {status:ERROR, message:str(e)} — _ldap_write
+    # must NOT remap it to INVALID_CREDENTIALS (only a bind failure is).
+    sp = _spoke()
+    sp.manager.create_user_scoped = lambda *a, **k: {
+        "status": "ERROR", "message": "Already exists"}
+    res = _run(sp.handle_command("LDAP_CREATE_USER", {
+        "uid": "dup", "attrs": {}, "tenant_slug": "lrb"}))
+    assert res["status"] == "ERROR"
+    assert res.get("error") is None  # not remapped to INVALID_CREDENTIALS
+    assert res["message"] == "Already exists"
+
+
+def test_manager_bind_raises_ldap_bind_error_on_invalid_credentials():
+    # The manager's _bind() converts a raw INVALID_CREDENTIALS from simple_bind_s
+    # into a LdapBindError carrying the actionable message (so per-method
+    # `except ldap.LDAPError` blocks don't swallow it).
+    class _Conn:
+        def simple_bind_s(self, dn, pw):
+            raise INVALID_CREDENTIALS("result 49")
+        def unbind_s(self):
+            pass
+    mgr = _mgr.LdapManager("cn=admin,dc=example,dc=org", "wrong",
+                           "dc=example,dc=org", "ldap://localhost:389")
+    with pytest.raises(LdapBindError) as ei:
+        mgr._bind(_Conn())
+    assert "LDAP_ADMIN_PW" in str(ei.value)
+    assert "UPDATE_CONFIG" in str(ei.value)
