@@ -661,49 +661,118 @@ class LdapManager:
             logger.error(f"Error renaming group {dn}: {e}")
             return {"status": "ERROR", "message": str(e)}
 
-    def search(self, query: str) -> Dict[str, Any]:
-        """
-        Search LDAP for users and computers matching a name, username, email, or hostname.
-        Returns normalised results tagged source="ldap".
-        """
-        q = query.strip()
-        results: List[Dict] = []
+    def search(self, query: str, tenant: Optional[str] = None,
+               is_admin: bool = False) -> Dict[str, Any]:
+        """Search LDAP for users and groups matching ``query``.
+
+        Scope (spoke-enforced; the hub now allows non-admin directory search but
+        expects the spoke to OU-scope it — ``TENANT == OU`` lowercase):
+          * ``tenant`` present        → search only under ``ou=<slug>,<base>``
+            (the tenant's OU, built via :func:`tenant_ou_dn` — never by hand).
+            SUBTREE scope picks up the ``ou=users`` / ``ou=groups`` containers
+            beneath it.
+          * ``tenant`` absent + admin → unscoped, whole ``base_dn`` (legacy).
+          * ``tenant`` absent + non-admin → EMPTY (never leak another tenant's
+            users/groups).
+
+        ``query`` is matched case-insensitively (LDAP ``caseIgnoreSubstringsMatch``
+        on the relevant attributes) against ``cn`` / ``sAMAccountName`` / ``uid``
+        / ``mail`` for users and ``cn`` / ``memberUid`` for groups. Users and
+        groups are selected by objectClass (person/user/inetOrgPerson vs
+        group/groupOfNames) in one combined filter.
+
+        Each result dict carries at minimum ``source``, ``type``, ``name``,
+        ``dn``; users also carry ``mail``. A bind failure raises
+        :class:`LdapBindError` (NOT ``ldap.LDAPError``) and is deliberately NOT
+        caught here — it bypasses the per-method catch and propagates to the
+        spoke's ``_ldap_write``, which maps it to the clean
+        ``INVALID_CREDENTIALS`` envelope (see memory
+        ``ldap-bind-error-bypasses-per-method-catches``)."""
+        q = (query or "").strip()
+        if not q:
+            return {"status": "SUCCESS", "results": [], "count": 0}
+
+        # ── Compute the search base from the tenant slug (no hand-rolled DNs) ──
+        if tenant:
+            try:
+                # tenant_ou_dn canonicalises (lower-cases) + escapes the slug;
+                # a bad slug raises ValueError → clean ERROR, no DN injection.
+                search_base = tenant_ou_dn(self.base_dn, tenant)
+            except ValueError as e:
+                logger.warning("LDAP search bad tenant slug %r: %s", tenant, e)
+                return {"status": "ERROR", "message": str(e), "results": []}
+        elif is_admin:
+            search_base = self.base_dn
+        else:
+            # Non-admin without a tenant scope gets nothing.
+            return {"status": "SUCCESS", "results": [], "count": 0}
+
+        results: List[Dict[str, Any]] = []
         try:
             conn = self._get_connection()
-            # Escape special chars for LDAP filter
-            safe_q = q.replace("\\", "\\5c").replace("*", "\\2a").replace("(", "\\28").replace(")", "\\29")
+            # RFC-4515 escape the substring filter value.
+            safe_q = (q.replace("\\", "\\5c").replace("*", "\\2a")
+                      .replace("(", "\\28").replace(")", "\\29"))
+            # One combined filter: users (person/user/inetOrgPerson) on
+            # cn/uid/mail/sAMAccountName OR groups (group/groupOfNames) on
+            # cn/memberUid.
             ldap_filter = (
-                f"(|"
-                f"(uid=*{safe_q}*)"
-                f"(cn=*{safe_q}*)"
-                f"(mail=*{safe_q}*)"
-                f"(sn=*{safe_q}*)"
-                f"(givenName=*{safe_q}*)"
-                f"(dNSHostName=*{safe_q}*)"
-                f")"
+                "(|"
+                f"(&(|(objectClass=person)(objectClass=user)(objectClass=inetOrgPerson))"
+                f"(|(cn=*{safe_q}*)(uid=*{safe_q}*)(mail=*{safe_q}*)(sAMAccountName=*{safe_q}*)))"
+                f"(&(|(objectClass=group)(objectClass=groupOfNames))"
+                f"(|(cn=*{safe_q}*)(memberUid=*{safe_q}*)))"
+                ")"
             )
-            attrs = ['uid', 'cn', 'sn', 'givenName', 'mail', 'objectClass', 'dNSHostName']
-            raw = conn.search_s(self.base_dn, ldap.SCOPE_SUBTREE, ldap_filter, attrs)
+            attrs = ['cn', 'uid', 'sn', 'givenName', 'mail', 'sAMAccountName',
+                     'memberUid', 'member', 'description', 'objectClass']
+            raw = conn.search_s(search_base, ldap.SCOPE_SUBTREE, ldap_filter, attrs)
             for dn, entry in raw:
                 if not dn:
                     continue
                 obj_classes = [c.decode() if isinstance(c, bytes) else c
                                for c in entry.get('objectClass', [])]
-                is_computer = 'computer' in obj_classes or 'device' in obj_classes
                 def _d(key: str) -> str:
                     v = entry.get(key, [b''])[0]
                     return (v.decode('utf-8') if isinstance(v, bytes) else v) if v else ''
-                results.append({
-                    "source":   "ldap",
-                    "type":     "computer" if is_computer else "user",
-                    "name":     _d('cn') or _d('uid'),
-                    "username": _d('uid'),
-                    "email":    _d('mail'),
-                    "dn":       dn,
-                    "hostname": _d('dNSHostName'),
-                    "id":       dn,
-                })
-        except Exception as e:
-            logger.error(f"LDAP search failed: {e}")
+                def _dl(key: str) -> List[str]:
+                    out = []
+                    for v in entry.get(key, []):
+                        out.append(v.decode('utf-8') if isinstance(v, bytes) else v)
+                    return out
+                is_group = any(oc in obj_classes for oc in ('group', 'groupOfNames'))
+                if is_group:
+                    members = _dl('member')
+                    member_uids = _dl('memberUid')
+                    results.append({
+                        "source":       "ldap",
+                        "type":         "group",
+                        "id":           dn,
+                        "name":         _d('cn'),
+                        "dn":           dn,
+                        "description":  _d('description'),
+                        "members":      members,
+                        "member_uids":  member_uids,
+                        "member_count": len(members) + len(member_uids),
+                    })
+                else:
+                    results.append({
+                        "source":     "ldap",
+                        "type":       "user",
+                        "id":         dn,
+                        "name":       _d('cn') or _d('uid') or _d('sAMAccountName'),
+                        "username":   _d('uid') or _d('sAMAccountName'),
+                        "mail":       _d('mail'),
+                        "email":      _d('mail'),
+                        "dn":         dn,
+                        "given_name": _d('givenName'),
+                        "surname":    _d('sn'),
+                    })
+        except ldap.LDAPError as e:
+            logger.error("LDAP search failed: %s", e)
             return {"status": "ERROR", "message": str(e), "results": []}
+        # NOTE: LdapBindError intentionally NOT caught here — it propagates to
+        # the spoke's _ldap_write → INVALID_CREDENTIALS envelope (bind error
+        # bypasses per-method catches; catching it here would swallow the
+        # actionable hint into a generic ERROR).
         return {"status": "SUCCESS", "results": results, "count": len(results)}

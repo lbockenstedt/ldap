@@ -203,7 +203,13 @@ class LdapSpoke(BaseSpoke):
             return await self._ldap_write(self.manager.delete_entity, data.get("dn"))
 
         if normalized_cmd == "SEARCH_USERS":
-            return await self._ldap_write(self.manager.search, data.get("q", ""))
+            # Global-search leg (directory users/groups). Now NON-ADMIN ALLOWED
+            # but TENANT-OU SCOPED — the hub passes {tenant, is_admin} and the
+            # manager enforces the OU scoping (TENANT == OU lowercase). Absent
+            # tenant + non-admin → empty (never leak another tenant's users).
+            return await self._ldap_write(
+                self.manager.search, data.get("q", ""),
+                data.get("tenant"), bool(data.get("is_admin")))
 
         if normalized_cmd == "LDAP_MIGRATE_TENANT":
             # Cross-tenant migration: re-home entries from source_base_dn to
