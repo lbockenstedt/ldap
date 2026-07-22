@@ -693,7 +693,15 @@ class LdapManager:
             return {"status": "SUCCESS", "results": [], "count": 0}
 
         # ── Compute the search base from the tenant slug (no hand-rolled DNs) ──
-        if tenant:
+        # Admins are trusted to see every OU, so they always search the whole
+        # base_dn — the tenant slug only narrows non-admins to their own OU.
+        # Checking `tenant` first (the old order) made the admin branch
+        # unreachable whenever a tenant slug was supplied, which hid users
+        # living outside ou=<slug>,<base> (legacy users, other tenants' OUs)
+        # and was the root cause of "search returns nothing" for admins.
+        if is_admin:
+            search_base = self.base_dn
+        elif tenant:
             try:
                 # tenant_ou_dn canonicalises (lower-cases) + escapes the slug;
                 # a bad slug raises ValueError → clean ERROR, no DN injection.
@@ -701,8 +709,6 @@ class LdapManager:
             except ValueError as e:
                 logger.warning("LDAP search bad tenant slug %r: %s", tenant, e)
                 return {"status": "ERROR", "message": str(e), "results": []}
-        elif is_admin:
-            search_base = self.base_dn
         else:
             # Non-admin without a tenant scope gets nothing.
             return {"status": "SUCCESS", "results": [], "count": 0}
