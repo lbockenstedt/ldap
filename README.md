@@ -4,6 +4,44 @@ This repository is the **LDAP directory spoke** for the Lab Manager (LM) hub/spo
 
 See [`docs/ldap.md`](docs/ldap.md) for the full feature reference and [`docs/architecture-topology.md`](docs/architecture-topology.md) for the shared hub/spoke/agent topology.
 
+<!-- INSTALLERS:START -->
+## Installation
+
+Every installer in this repo, with every flag and environment variable it accepts.
+Installers are idempotent — re-running one updates code and preserves credentials.
+
+### LDAP (directory) spoke — `install_ldap.sh`
+
+```bash
+curl -sSL https://raw.githubusercontent.com/lbockenstedt/ldap/main/install_ldap.sh \
+  | sudo bash -s -- --hub lm-hub.lrbtechnologies.com
+```
+
+Two modes, mirroring `netbox/install.sh`: by default it installs the **spoke** that manages an LDAP server at `--server-url` (local or remote) without provisioning one. `HUB_URL` defaults to `auto`.
+
+| Flag | Purpose |
+| :--- | :--- |
+| `--hub URL` | Hub WebSocket URL. A bare host is fine — `lm-hub.example.com` becomes `wss://lm-hub.example.com:443`, `host:port` gets a `wss://` prefix, and an explicit `ws://`/`wss://` is left alone. Omit it to auto-discover the hub (DNS `lm-hub.<suffix>`, then mDNS `_lm-hub._tcp.local.`). |
+| `--id`, `--name` | Pin the spoke id. Omitted, the id derives from the hostname, so a renamed clone reconnects under its new name. |
+| `--secret` | Pre-shared spoke secret. |
+| `--hub-secret` | Hub PSK for auto-approval. Without it the spoke lands in *pending approval* in the WebUI. |
+| `--all-prereqs` | Accepted and ignored — kept so the hub's install-module call doesn't abort. |
+| `--infra-only` | Host-level infrastructure only — no spoke runtime. |
+| `--server-url` | LDAP server this spoke manages (local or remote). |
+| `--base-dn` | Directory base DN. Default `dc=example,dc=org`. |
+| `--admin-dn` | Admin bind DN. Default `cn=admin,dc=example,dc=org`. |
+| `--admin-pw` | Admin bind password. |
+| `--server-id` | Node id within a mirror pair. |
+| `--peer` | Mirror peer. Repeatable — pass once per peer. |
+| `--entra-tenant` | Entra tenant id for the mirror/ROPC path. |
+| `--entra-client` | Entra application (client) id. |
+| `--entra-cert` | Path to the Entra client certificate. |
+| `--entra-key` | Path to its private key. |
+| `--entra-scope` | OAuth scope requested from Entra. |
+
+**Environment overrides:** `HUB_URL` (same normalization as `--hub`), `SPOKE_ID`., `BASE_DN`, `ADMIN_DN`, `ADMIN_PW`, `HUB_SECRET`
+<!-- INSTALLERS:END -->
+
 ## Files
 
 - `install_ldap.sh` — Bash installer with **two modes**:
