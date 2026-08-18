@@ -17,11 +17,11 @@ curl -sSL https://raw.githubusercontent.com/lbockenstedt/ldap/main/install_ldap.
   | sudo bash -s -- --hub lm-hub.lrbtechnologies.com
 ```
 
-Two modes, mirroring `netbox/install.sh`: by default it installs the **spoke** that manages an LDAP server at `--server-url` (local or remote) without provisioning one. `HUB_URL` defaults to `auto`.
+Two modes, mirroring `netbox/install.sh`: by default it installs the **spoke** that manages an LDAP server at `--server-url` (local or remote) without provisioning one. `--hub` is required for the spoke runtime.
 
 | Flag | Purpose |
 | :--- | :--- |
-| `--hub URL` | Hub WebSocket URL. A bare host is fine — `lm-hub.example.com` becomes `wss://lm-hub.example.com:443`, `host:port` gets a `wss://` prefix, and an explicit `ws://`/`wss://` is left alone. Omit it to auto-discover the hub (DNS `lm-hub.<suffix>`, then mDNS `_lm-hub._tcp.local.`). |
+| `--hub URL` | Hub WebSocket URL. A bare host is fine — `lm-hub.example.com` becomes `wss://lm-hub.example.com:443`, `host:port` gets a `wss://` prefix, and an explicit `ws://`/`wss://` is left alone. Pass `auto` explicitly to use hub auto-discovery (DNS `lm-hub.<suffix>`, then mDNS `_lm-hub._tcp.local.`). |
 | `--id`, `--name` | Pin the spoke id. Omitted, the id derives from the hostname, so a renamed clone reconnects under its new name. |
 | `--secret` | Pre-shared spoke secret. |
 | `--hub-secret` | Hub PSK for auto-approval. Without it the spoke lands in *pending approval* in the WebUI. |
@@ -80,7 +80,7 @@ Post-`--infra-only` args (all optional; the hub's `ldap-server` role passes exac
 sudo ./install_ldap.sh --hub wss://172.16.1.31:443 --id ldap-spoke-1
 ```
 
-`--hub` accepts a bare IP/host (normalized to `wss://<host>:443`); omit it (or pass `auto`) to auto-discover the hub via mDNS/DNS. Other flags: `--id`/`--name`, `--secret` (PSK; omit to connect unauthenticated and await WebUI approval), `--hub-secret`, `--server-url` (local or remote server), `--all-prereqs` (no-op). The spoke's `.env` defaults `LDAP_ADMIN_PW=` (empty — set it, or push config from the WebUI, before the spoke can bind). A single box can run both modes (server + spoke) co-located.
+`--hub` is required and accepts a bare IP/host (normalized to `wss://<host>:443`); pass `auto` explicitly to auto-discover the hub via mDNS/DNS. Other flags: `--id`/`--name`, `--secret` (PSK; omit to connect unauthenticated and await WebUI approval), `--hub-secret`, `--server-url` (local or remote server), `--all-prereqs` (no-op). The spoke's `.env` defaults `LDAP_ADMIN_PW=` (empty — set it, or push config from the WebUI, before the spoke can bind). A single box can run both modes (server + spoke) co-located.
 
 ## Verification
 
@@ -100,4 +100,4 @@ Replace `dc=example,dc=org` with your actual base DN.
 
 - A fresh installation of Ubuntu or Debian.
 - Root or sudo access (the installer and `INSTALL_CERT` require root).
-- An LM hub reachable at `wss://<hub>:443` (or auto-discovered via mDNS/DNS).
+- An LM hub reachable at `wss://<hub>:443` (or pass `--hub auto` explicitly to auto-discover via mDNS/DNS).
