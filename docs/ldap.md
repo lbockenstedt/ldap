@@ -1,3 +1,8 @@
+---
+summary: "LDAP directory spoke. Repo: ldap. moduletype = 'directory'. See architecture-topology.md."
+keywords: [backends, behaviors, commands, install_cert, install_ldap, ldap, ldap_server_url, lm, tenant_slug, update_config]
+---
+
 # ldap — Directory
 
 LDAP directory spoke. Repo: `ldap`. `module_type = "directory"`. See [architecture-topology.md](architecture-topology.md).
