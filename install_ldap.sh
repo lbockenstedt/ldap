@@ -1,4 +1,14 @@
 #!/bin/bash
+
+# Resolve the branch this checkout is deployed on so a dev/qa host is not
+# hard-reset back onto main by an installer re-run. Detached HEAD (or any git
+# failure) falls back to main.
+_deployed_branch() {
+  local b
+  b=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+  case "$b" in ""|HEAD) echo main ;; *) echo "$b" ;; esac
+}
+
 set -e
 
 # =============================================================================
@@ -181,7 +191,7 @@ setup_repo_and_venv() {
     retire_legacy_agent   # purge a legacy lm-generic-agent leaf before (re)cloning
     if [ -d "ldap/.git" ]; then
         echo "📂 LDAP repository already exists. Updating..."
-        cd ldap && git fetch origin -q && git reset --hard origin/main && cd ..
+        cd ldap && BR=$(_deployed_branch) && git fetch origin -q "$BR" && git reset --hard "origin/$BR" && cd ..
     else
         echo "🌐 Cloning LDAP repository..."
         git clone "$REPO_URL"
