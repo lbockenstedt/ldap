@@ -56,12 +56,14 @@ class LdapManager:
     injection (the spoke binds as admin, so this is security-critical)."""
 
     def __init__(self, admin_dn: str, admin_pw: str, base_dn: str, server_url: str = "ldap://localhost:389"):
+        """Initialize LDAP directory manager with administrative bind credentials and base DN."""
         self.admin_dn = admin_dn
         self.admin_pw = admin_pw
         self.base_dn = base_dn
         self.server = server_url
 
     def _get_connection(self):
+        """Create and bind a new LDAP client connection using admin credentials."""
         conn = ldap.initialize(self.server)
         self._bind(conn)
         return conn
@@ -122,6 +124,7 @@ class LdapManager:
         return b'{SSHA}' + base64.b64encode(digest + salt)
 
     def list_ous(self) -> List[Dict[str, Any]]:
+        """List all Organizational Unit entries located beneath the base DN."""
         with self._conn() as conn:
             results = conn.search_s(self.base_dn, ldap.SCOPE_SUBTREE, "(objectClass=organizationalUnit)", ['ou', 'description'])
         ous = []
@@ -132,6 +135,7 @@ class LdapManager:
         return ous
 
     def create_ou(self, ou_name: str, parent_dn: str = None) -> Dict[str, Any]:
+        """Create a new Organizational Unit entry with escaped RDN under the parent DN."""
         conn = self._get_connection()
         dn = f"ou={self._escape_rdn(ou_name)},{parent_dn if parent_dn else self.base_dn}"
         attrs = {
@@ -146,6 +150,7 @@ class LdapManager:
             return {"status": "ERROR", "message": str(e)}
 
     def list_users(self) -> List[Dict[str, Any]]:
+        """Search and return all person objects under the directory base DN."""
         with self._conn() as conn:
             results = conn.search_s(self.base_dn, ldap.SCOPE_SUBTREE, "(objectClass=person)", ['uid', 'cn', 'sn', 'givenName', 'mail'])
         users = []
@@ -160,6 +165,7 @@ class LdapManager:
         return users
 
     def create_user(self, username: str, first_name: str, last_name: str, email: str, ou_dn: str, password: Optional[str] = None) -> Dict[str, Any]:
+        """Create an inetOrgPerson user entry with {SSHA}-hashed password."""
         conn = self._get_connection()
         dn = f"uid={self._escape_rdn(username)},{ou_dn}"
         # Use a caller-provided password, or generate a strong random one (never a hardcoded default).
@@ -181,6 +187,7 @@ class LdapManager:
             return {"status": "ERROR", "message": str(e)}
 
     def list_groups(self) -> List[Dict[str, Any]]:
+        """List all groupOfNames and posixGroup entries with their members."""
         with self._conn() as conn:
             results = conn.search_s(self.base_dn, ldap.SCOPE_SUBTREE, "(|(objectClass=groupOfNames)(objectClass=posixGroup))", ['cn', 'member', 'memberUid', 'description'])
         groups = []
@@ -197,6 +204,7 @@ class LdapManager:
         return groups
 
     def create_group(self, group_name: str, ou_dn: str) -> Dict[str, Any]:
+        """Create a new groupOfNames entry seeded with a base DN member."""
         conn = self._get_connection()
         dn = f"cn={self._escape_rdn(group_name)},{ou_dn}"
         attrs = {
@@ -212,6 +220,7 @@ class LdapManager:
             return {"status": "ERROR", "message": str(e)}
 
     def add_user_to_group(self, user_dn: str, group_dn: str) -> Dict[str, Any]:
+        """Add a member DN to the specified group entry."""
         conn = self._get_connection()
         try:
             conn.modify_s(group_dn, ldap.MOD_ADD, [('member', [user_dn.encode('utf-8')])])
@@ -221,6 +230,7 @@ class LdapManager:
             return {"status": "ERROR", "message": str(e)}
 
     def remove_user_from_group(self, user_dn: str, group_dn: str) -> Dict[str, Any]:
+        """Remove a member DN from the specified group entry."""
         conn = self._get_connection()
         try:
             conn.modify_s(group_dn, ldap.MOD_DELETE, [('member', [user_dn.encode('utf-8')])])
@@ -230,6 +240,7 @@ class LdapManager:
             return {"status": "ERROR", "message": str(e)}
 
     def set_password(self, user_dn: str, new_password: str) -> Dict[str, Any]:
+        """Set or update password for user DN using Password-Modify or attribute replacement."""
         conn = self._get_connection()
         try:
             conn.passwd_s(user_dn, None, new_password.encode('utf-8'))
@@ -244,6 +255,7 @@ class LdapManager:
                 return {"status": "ERROR", "message": str(e)}
 
     def delete_entity(self, dn: str) -> Dict[str, Any]:
+        """Delete an LDAP entry by distinguished name."""
         conn = self._get_connection()
         try:
             conn.delete_s(dn)

@@ -86,6 +86,7 @@ validate_slug = canonical_slug
 
 
 def _base(base_dn: str) -> str:
+    """Validate and return non-empty base DN string."""
     b = (base_dn or "").strip()
     if not b:
         raise ValueError("base_dn is required")

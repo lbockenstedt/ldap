@@ -27,6 +27,7 @@ DEFAULT_DB_DN = "olcDatabase={1}mdb,cn=config"
 
 
 def _clean_peers(peers) -> List[str]:
+    """Filter and clean list of peer LDAP URLs, removing empty or whitespace items."""
     out = []
     for p in peers or []:
         p = (p or "").strip()
