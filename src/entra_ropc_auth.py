@@ -205,6 +205,7 @@ def authenticate(cfg: Dict[str, str], username: str, password: str, **kw) -> boo
 
 
 def _configure_logging() -> None:
+    """Set up stderr and optional file logging for Entra ROPC events."""
     handlers = [logging.StreamHandler(sys.stderr)]
     try:
         os.makedirs(os.path.dirname(_LOG_FILE), exist_ok=True)
