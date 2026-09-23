@@ -1,8 +1,95 @@
-# LDAP Spoke — Lab Manager Directory Module
+# ldap — LDAP Directory Spoke (Lab Manager Module)
 
-This repository is the **LDAP directory spoke** for the Lab Manager (LM) hub/spoke fleet (`module_type = "directory"`). It wraps an OpenLDAP/389-DS-style LDAP server (`slapd`) and exposes OU/user/group CRUD, group membership, password reset, rename, a unified user/computer search, and a hub-brokered TLS certificate install — all from the LM WebUI's **Directory** view instead of `ldapsearch`/`ldapmodify` on the command line.
+LDAP directory spoke for the Lab Manager (LM) hub-and-spoke fleet (`module_type = "directory"`). Manages an OpenLDAP/389-DS directory server (`slapd`), providing OU/user/group lifecycle management, POSIX and LDAP group memberships, password management, cross-tenant isolation, directory replication, and hub-brokered TLS certificate deployment.
 
-See [`docs/ldap.md`](docs/ldap.md) for the full feature reference and [`docs/architecture-topology.md`](docs/architecture-topology.md) for the shared hub/spoke/agent topology.
+---
+
+## Architecture & Overview
+
+The `ldap` spoke bridges Lab Manager to OpenLDAP/389-DS directory servers over a persistent outbound WebSocket connection (port 443).
+
+```
+ +-------------------------------------------------------+
+ |                     Lab Manager Hub                   |
+ +-------------------------------------------------------+
+           | (Outbound WebSocket over TLS, port 443)
+           v
+ +-------------------------------------------------------+
+ |                  LdapControlPlane                     |
+ |  (Registers module "ldap", dispatches WebSocket cmds) |
+ +-------------------------------------------------------+
+           |
+           v
+ +-------------------------------------------------------+
+ |                 LDAPSpoke (LdapSpoke)                 |
+ |  - Spoke coordinator & command dispatcher             |
+ |  - Threaded worker execution (asyncio.to_thread)      |
+ |  - Clean error envelopes (LdapBindError / LDAPError)  |
+ |  - Hub-brokered TLS cert installer (INSTALL_CERT)     |
+ +-------------------------------------------------------+
+      |               |                    |
+      v               v                    v
++--------------+ +-------------------+ +--------------------+
+| LdapManager  | | Entra ROPC Bridge | | Replication Engine |
+| - python-ldap| | - pam_exec ROPC   | | - syncrepl mirror  |
+| - OU/User/Grp| | - SASL pass-thru  | | - cn=config LDIF   |
+| - DN escaping| | - Azure AD auth   | | - Multi-master sync|
++--------------+ +-------------------+ +--------------------+
+           \                  |                  /
+            v                 v                 v
+   +----------------------------------------------------+
+   |               slapd (OpenLDAP Daemon)              |
+   |           ldap://localhost:389 / ldapi:///         |
+   +----------------------------------------------------+
+```
+
+- **Spoke Coordinator (`LDAPSpoke` / `LdapSpoke`):** Subclasses `BaseSpoke` to dispatch hub commands to worker threads (`asyncio.to_thread`) so slow directory operations never block the event loop or drop WebSockets.
+- **`slapd` Daemon Management:** Manages local or remote OpenLDAP daemons, runtime `cn=config` reconfiguration via `ldapi:///` SASL EXTERNAL, and service control.
+- **LDIF Templating & DN Parsing (`ldif_template.py`, `ldap_dn.py`):** Pure-Python helpers handling RFC-4514 DN escaping, canonical slug resolution, and parameterized LDIF template rendering for initial setups.
+- **Entra ID ROPC Authentication Fallback (`entra_ropc_auth.py`):** Bridges SASL binds to Azure AD / Entra ID using Resource Owner Password Credentials (ROPC) with client certificate authentication.
+- **Directory Replication Engine (`replication.py`):** Configures N-way multi-master syncrepl mirror mode across nodes using dynamic `cn=config` LDIF modifications.
+- **TLS Certificate Distribution Target (`INSTALL_CERT`):** Deploys ACME certificates issued by the `le` module directly to `/etc/ldap/tls/`, updates `cn=config` TLS attributes, and restarts `slapd`.
+
+---
+
+## Features
+
+- **Organizational Unit (OU) Lifecycle:** Create, list, rename (`modrdn`), and delete hierarchical directory OUs.
+- **User Lifecycle Management:** Create users (`inetOrgPerson`) with auto-generated secure passwords or custom credentials, modify user metadata, delete entries, and reset passwords via LDAP Password-Modify operations.
+- **Group Lifecycle Management:** Create and update `groupOfNames` and POSIX groups, manage member DN lists with safe seeding, and add or remove memberships atomically.
+- **Search & Unified User/Computer Discovery (`SEARCH_USERS`):** Cross-system user and workstation search that feeds into Lab Manager's global search index with tenant-aware scoping.
+- **Tenant Isolation & Multi-Tenancy OU Provisioning (`LDAP_PROVISION_TENANT_OU`):** Provisions isolated OU sub-trees (`ou=<tenant_slug>,<base_dn>`) with partitioned `users` and `groups` containers ensuring strict tenant separation.
+- **Automated TLS Certificate Installation:** Ingests issued x509 full chains and private keys, chowns keys to the OpenLDAP process user, and updates directory TLS settings seamlessly.
+
+---
+
+## Spoke Commands Reference
+
+The following commands are handled by `LdapSpoke`:
+
+| Command | Arguments | Description |
+| :--- | :--- | :--- |
+| `GET_VERSION` | *None* | Retrieves the module semantic version from the `VERSION` file. |
+| `UPDATE_CONFIG` | `LDAP_SERVER_URL`, `LDAP_ADMIN_DN`, `LDAP_ADMIN_PW`, `LDAP_BASE_DN`, Entra/Replication settings | Re-initializes `LdapManager`, persists `.env` changes, and re-applies mirror-mode configuration. |
+| `LIST_OUS` | *None* | Lists all Organizational Units under the configured directory base DN. |
+| `CREATE_OU` | `name`, `parent_dn` | Creates a new Organizational Unit under the base DN or a specified parent DN. |
+| `UPDATE_OU` | `dn`, `name` | Renames an existing Organizational Unit via LDAP `modrdn`. |
+| `LIST_USERS` | *None* | Returns all users across the directory base tree. |
+| `CREATE_USER` | `username`, `first_name`, `last_name`, `email`, `ou_dn`, `password` | Creates an `inetOrgPerson` user; generates and returns a random password if omitted. |
+| `UPDATE_USER` | `dn`, `first_name`, `last_name`, `email`, `username` | Updates contact details and attributes on an existing user entry. |
+| `LIST_GROUPS` | *None* | Lists all `groupOfNames` directories. |
+| `CREATE_GROUP` | `name`, `ou_dn` | Creates a new group populated with a default base placeholder member. |
+| `UPDATE_GROUP` | `dn`, `name` | Renames an existing directory group. |
+| `ADD_USER_TO_GROUP` | `user_dn`, `group_dn` | Adds a user's distinguished name to the target group's `member` list. |
+| `REMOVE_USER_FROM_GROUP` | `user_dn`, `group_dn` | Removes a user's distinguished name from the target group's `member` list. |
+| `SET_PASSWORD` | `user_dn`, `password` | Sets a user's password using the Password-Modify extended operation or direct `{SSHA}` hash update. |
+| `DELETE_ENTITY` | `dn` | Deletes any leaf directory entity (user, group, or OU) by DN. |
+| `SEARCH_USERS` | `q`, `tenant`, `is_admin` | Global search query matching `uid`, `cn`, `mail`, and `dNSHostName` with tenant scoping. |
+| `LDAP_MIGRATE_TENANT` | `source_base_dn`, `target_base_dn`, `purge_source` | Re-homes directory entries from an old tenant base DN to a new target base DN. |
+| `LDAP_PROVISION_TENANT_OU` | `tenant_slug` | Idempotently provisions a tenant tree (`ou=<slug>`, `ou=users`, `ou=groups`). |
+| `INSTALL_CERT` | `fullchain`, `privkey`, `chain` | Installs an ACME TLS certificate into `/etc/ldap/tls/`, updates `cn=config`, and restarts `slapd`. |
+
+---
 
 <!-- INSTALLERS:START -->
 ## Installation
@@ -41,63 +128,3 @@ Two modes, mirroring `netbox/install.sh`: by default it installs the **spoke** t
 
 **Environment overrides:** `HUB_URL` (same normalization as `--hub`), `SPOKE_ID`., `BASE_DN`, `ADMIN_DN`, `ADMIN_PW`, `HUB_SECRET`
 <!-- INSTALLERS:END -->
-
-## Files
-
-- `install_ldap.sh` — Bash installer with **two modes**:
-  - **(default)** installs the LM **directory spoke** that MANAGES a server (clones this repo into `/opt/lm/ldap`, builds the venv, writes `.env` + the `lm-ldap.service` systemd unit). Talks to `LDAP_SERVER_URL` (local OR remote); does NOT install `slapd`.
-  - **`--infra-only`** provisions the **slapd server** fully zero-CLI: canonical base DN, auto-generated admin password, base structure applied, self-signed TLS (LDAPS), optional 2-node syncrepl mirror-mode, and the Entra ROPC SASL pass-through bridge. Installs no spoke unit. This is what the hub's `ldap-server` deploy role runs via `curl -sSL … | bash -s -- --infra-only <args>`. Idempotent + non-interactive.
-  - The `lm-ldap.service` unit runs as `User=root` so `INSTALL_CERT` / mirror-mode re-apply can `ldapmodify -Y EXTERNAL` against `cn=config` and `systemctl restart slapd`.
-- `base_structure.ldif` — the base-level `ou=users` / `ou=groups` containers, carrying an `@@BASE_DN@@` placeholder. `--infra-only` renders it (via `src/ldif_template.py`) with the chosen base DN and applies it idempotently. (No seed user — an auto-applied cleartext password would be a credential at rest.)
-- `src/main.py` — `LdapControlPlane` (the spoke entrypoint, `python3 -m src.main`).
-- `src/ldap_spoke.py` — `LdapSpoke(BaseSpoke)`; the hub-facing command dispatcher + `INSTALL_CERT` + `UPDATE_CONFIG` (Entra `.env` + mirror-mode re-apply).
-- `src/ldap_manager.py` — `LdapManager`; the synchronous `python-ldap` CRUD wrapper (incl. tenant-scoped `LDAP_*` operations).
-- `src/ldap_dn.py`, `src/ldif_template.py`, `src/replication.py` — dependency-free, unit-tested pure helpers (tenant-scoped DN math + escaping; base-structure LDIF templating; syncrepl mirror-mode LDIF builders). Shared by the installer (`python3 -m src.<mod>`) and the spoke.
-- `src/entra_ropc_auth.py` — the `pam_exec` Entra ID ROPC pass-through authenticator (validates `{SASL}` binds against Entra).
-- `tests/` — `test_install_cert.py` (INSTALL_CERT), `test_ldap_dn.py`, `test_ldif_template.py`, `test_replication.py`, `test_entra_ropc.py` (all stub/avoid `python-ldap`).
-
-## How it runs
-
-LDAP runs **primarily as the `ldap` role** hosted by the generic agent (`agent-<hostname>`, unit `lm-agent`): the agent opens a sub-spoke `{agent}-ldap` (module_type `directory`, parent-auto-approved) and self-installs this repo. The `install_ldap.sh` / `lm-ldap.service` standalone path is the **legacy** alternative for a dedicated single-purpose box. In either mode, connection settings (`LDAP_SERVER_URL`, `LDAP_ADMIN_DN`, `LDAP_ADMIN_PW`, `LDAP_BASE_DN`) are **pushed by the hub** via `UPDATE_CONFIG` from the WebUI Directory setup form — not read from a per-module `.env`.
-
-## Install
-
-**Provision the server (zero-CLI):**
-
-```bash
-sudo ./install_ldap.sh --infra-only \
-  --base-dn dc=lm,dc=local --server-id 1 \
-  --peer ldaps://ldap2.lm.local:636 \
-  --entra-tenant <tenant-guid> --entra-client <client-guid> \
-  --entra-cert /etc/lm/entra/client-cert.pem --entra-key /etc/lm/entra/client-key.pem
-```
-
-Post-`--infra-only` args (all optional; the hub's `ldap-server` role passes exactly these): `--base-dn <dn>` (derived from the host DNS domain if omitted, fallback `dc=lm,dc=local`), `--admin-dn <dn>` (default `cn=admin,<base-dn>`), `--admin-pw <pw>` (auto-generated strong password if omitted — printed once at the end), `--server-id <1|2>` + `--peer <ldap-url>` (repeatable) for mirror-mode, `--entra-tenant/--entra-client/--entra-cert/--entra-key/--entra-scope`, `--server-url`. Re-runnable/idempotent. **The base DN is fixed at first install** (slapd won't re-suffix an existing DB).
-
-**Install the managing spoke:**
-
-```bash
-sudo ./install_ldap.sh --hub wss://172.16.1.31:443 --id ldap-spoke-1
-```
-
-`--hub` is required and accepts a bare IP/host (normalized to `wss://<host>:443`); pass `auto` explicitly to auto-discover the hub via mDNS/DNS. Other flags: `--id`/`--name`, `--secret` (PSK; omit to connect unauthenticated and await WebUI approval), `--hub-secret`, `--server-url` (local or remote server), `--all-prereqs` (no-op). The spoke's `.env` defaults `LDAP_ADMIN_PW=` (empty — set it, or push config from the WebUI, before the spoke can bind). A single box can run both modes (server + spoke) co-located.
-
-## Verification
-
-Once installed and the spoke has bound (green status in the WebUI), verify the server directly:
-
-```bash
-# List all entries under your base DN:
-ldapsearch -x -b "dc=example,dc=org" -H ldap://localhost
-
-# Test admin bind (use the password you set in the WebUI or .env):
-ldapsearch -x -D "cn=admin,dc=example,dc=org" -w "yourpassword" -b "dc=example,dc=org"
-```
-
-Replace `dc=example,dc=org` with your actual base DN.
-
-## Prerequisites
-
-- A fresh installation of Ubuntu or Debian.
-- Root or sudo access (the installer and `INSTALL_CERT` require root).
-- An LM hub reachable at `wss://<hub>:443` (or pass `--hub auto` explicitly to auto-discover via mDNS/DNS).

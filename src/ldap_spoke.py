@@ -30,6 +30,7 @@ class LdapSpoke(BaseSpoke):
     LDAP integration spoke. Hosts the LDAP server and provides a management API.
     """
     def __init__(self, spoke_id: str, config: Dict[str, Any], control_plane=None):
+        """Initialize the LDAP spoke instance and instantiate LdapManager."""
         super().__init__(spoke_id, config)
         self.manager = LdapManager(
             admin_dn=self.config.get("LDAP_ADMIN_DN", "cn=admin,dc=example,dc=org"),
@@ -420,6 +421,7 @@ class LdapSpoke(BaseSpoke):
 
     @staticmethod
     def _write_pem(path: str, content: str, mode: int) -> None:
+        """Atomically write PEM certificate content to path with specified file mode."""
         # Atomic + correct-mode-from-creation: create the temp file with `mode` so
         # a 0600 key is never briefly world-readable, then os.replace (a crash
         # mid-write leaves the old file intact, not a truncated cert/key).
@@ -477,6 +479,7 @@ class LdapSpoke(BaseSpoke):
     )
 
     def _env_path(self) -> str:
+        """Return absolute path to .env file for configuration persistence."""
         return os.environ.get("LDAP_ENV_PATH") or str(Path(__file__).parent.parent / ".env")
 
     def _persist_env(self, data: Dict[str, Any]) -> None:
