@@ -27,6 +27,7 @@ def render_base_structure(template_text: str, base_dn: str) -> str:
 
 
 def _main(argv) -> int:
+    """CLI entrypoint to render base structure LDIF template to stdout."""
     if len(argv) < 2:
         sys.stderr.write(
             "usage: python3 -m src.ldif_template <base_dn> [template_path]\n")
