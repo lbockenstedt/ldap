@@ -248,13 +248,14 @@ jobs:
               *ACTION_REQUIRED*)
                 echo "::warning::#$NUM has parked/unapproved checks ($rollup); leaving it open for a human"
                 exit 0 ;;
-              *FAILURE*|*TIMED_OUT*|*CANCELLED*)
+              *FAILURE*|*TIMED_OUT*|*CANCELLED*|*STARTUP_FAILURE*|*STALE*|*ERROR*)
                 echo "::warning::#$NUM has failing checks ($rollup); leaving it open for a human"
                 exit 0 ;;
               *SUCCESS*|*NEUTRAL*|*SKIPPED*|"")
                 break ;;
               *)
-                break ;;
+                echo "::warning::#$NUM has unrecognised check status ($rollup); leaving it open for a human"
+                exit 0 ;;
             esac
           done
 
