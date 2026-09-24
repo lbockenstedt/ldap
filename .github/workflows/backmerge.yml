@@ -243,6 +243,8 @@ jobs:
             rollup=$(gh pr view "$NUM" --json statusCheckRollup \
                        -q '[.statusCheckRollup[]? | .conclusion // .status] | join(",")')
             case "$rollup" in
+              "")
+                sleep 10; continue ;;
               *IN_PROGRESS*|*QUEUED*|*PENDING*|*WAITING*|*REQUESTED*)
                 sleep 10; continue ;;
               *ACTION_REQUIRED*)
@@ -251,7 +253,7 @@ jobs:
               *FAILURE*|*TIMED_OUT*|*CANCELLED*|*STARTUP_FAILURE*|*STALE*|*ERROR*)
                 echo "::warning::#$NUM has failing checks ($rollup); leaving it open for a human"
                 exit 0 ;;
-              *SUCCESS*|*NEUTRAL*|*SKIPPED*|"")
+              *SUCCESS*|*NEUTRAL*|*SKIPPED*)
                 break ;;
               *)
                 echo "::warning::#$NUM has unrecognised check status ($rollup); leaving it open for a human"
