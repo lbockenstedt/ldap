@@ -38,13 +38,14 @@ name: backmerge
 #
 # NO LOOP, and this is the property to preserve when editing:
 #   * Nothing here ever writes to main, so a push to main cannot re-trigger the
-#     workflow (pinned by test_never_writes_to_main).
+#     workflow.
 #   * The back-merge graph is strictly DOWNWARD -- main -> {qa,dev}, qa -> dev.
 #     dev is never a source, so it is a terminal node. The longest possible
 #     chain is main -> qa -> dev and then it stops.
-#   * In practice even that chain does not fire: a merge performed with
+#   * In practice even that chain does not loop: a back-merge performed by
 #     GITHUB_TOKEN does not spawn new workflow runs, and main -> dev is opened
-#     in parallel anyway, so qa -> dev has nothing left to carry.
+#     in parallel anyway. Promotion PRs (dev -> qa) are merged by humans, so
+#     that landing on qa triggers qa -> dev to return promotion-branch fixes.
 # Do not add dev as a source, and do not add main as a target.
 #
 # VERSION is handled by the same .github/scripts/promote.sh used by promote.yml
@@ -72,7 +73,7 @@ jobs:
       group: backmerge-${{ matrix.source }}-to-${{ matrix.target }}
       cancel-in-progress: false
     strategy:
-      fail-fast: false   # dev must still be offered the change if qa conflicts
+      fail-fast: false   # other targets must still be offered the change if one conflicts
       # Every DOWNWARD edge of the promotion graph. `include` rather than two
       # crossed lists because main -> qa, main -> dev and qa -> dev are the only
       # legal pairs: the cross product would also produce qa -> qa and the
@@ -92,17 +93,26 @@ jobs:
           - source: qa
             target: dev
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Skip pairs that do not apply to this push, or a missing target
-        id: exists
+      - name: Skip pairs that do not apply to this push
+        id: check_source
         run: |
           if [ "${{ matrix.source }}" != "${{ github.ref_name }}" ]; then
             echo "::notice::push was to '${{ github.ref_name }}'; the ${{ matrix.source }} -> ${{ matrix.target }} back-merge does not apply"
-            echo "ok=false" >> "$GITHUB_OUTPUT"
-          elif git rev-parse --verify "origin/${{ matrix.target }}" >/dev/null 2>&1; then
+            echo "match=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "match=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.check_source.outputs.match == 'true'
+        with:
+          fetch-depth: 0
+
+      - name: Check target branch exists
+        id: exists
+        if: steps.check_source.outputs.match == 'true'
+        run: |
+          if git rev-parse --verify "origin/${{ matrix.target }}" >/dev/null 2>&1; then
             echo "ok=true" >> "$GITHUB_OUTPUT"
           else
             echo "::notice::no '${{ matrix.target }}' branch in this repo; nothing to back-merge"
@@ -144,11 +154,10 @@ jobs:
           fi
           {
             printf 'Automated back-merge of `%s` into `%s`.\n\n' "$SRC" "$TGT"
-            printf 'Opened because `%s` moved without coming through the promotion\n' "$SRC"
-            printf 'flow -- a direct commit, the merge commit from a promotion PR, or a\n'
-            printf 'fix committed onto a promotion branch while that promotion was being\n'
-            printf 'reviewed. That last one only ever exists on `%s`: without this PR,\n' "$SRC"
-            printf '`%s` would re-promote the unfixed code and the same defect would be\n' "$TGT"
+            printf 'Opened because `%s` moved -- via a promotion merge commit, a direct\n' "$SRC"
+            printf 'commit, or a fix committed onto a promotion branch while that promotion\n'
+            printf 'was being reviewed. That last one only ever exists on `%s`: without this\n' "$SRC"
+            printf 'PR, `%s` would re-promote the unfixed code and the same defect would be\n' "$TGT"
             printf 'found again next cycle.\n\n'
             printf 'Carries **code only** -- every tracked `VERSION` file is pinned to\n'
             printf '`%s`'"'"'s own sequence, so `%s`'"'"'s version does not leak backwards.\n\n' "$TGT" "$SRC"
