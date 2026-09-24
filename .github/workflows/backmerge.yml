@@ -144,11 +144,10 @@ jobs:
           fi
           {
             printf 'Automated back-merge of `%s` into `%s`.\n\n' "$SRC" "$TGT"
-            printf 'Opened because `%s` moved without coming through the promotion\n' "$SRC"
-            printf 'flow -- a direct commit, the merge commit from a promotion PR, or a\n'
-            printf 'fix committed onto a promotion branch while that promotion was being\n'
-            printf 'reviewed. That last one only ever exists on `%s`: without this PR,\n' "$SRC"
-            printf '`%s` would re-promote the unfixed code and the same defect would be\n' "$TGT"
+            printf 'Opened because `%s` moved -- via a promotion merge commit, a direct\n' "$SRC"
+            printf 'commit, or a fix committed onto a promotion branch while that promotion\n'
+            printf 'was being reviewed. That last one only ever exists on `%s`: without this\n' "$SRC"
+            printf 'PR, `%s` would re-promote the unfixed code and the same defect would be\n' "$TGT"
             printf 'found again next cycle.\n\n'
             printf 'Carries **code only** -- every tracked `VERSION` file is pinned to\n'
             printf '`%s`'"'"'s own sequence, so `%s`'"'"'s version does not leak backwards.\n\n' "$TGT" "$SRC"
