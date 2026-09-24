@@ -44,8 +44,10 @@ name: backmerge
 #     chain is main -> qa -> dev and then it stops.
 #   * In practice even that chain does not loop: a back-merge performed by
 #     GITHUB_TOKEN does not spawn new workflow runs, and main -> dev is opened
-#     in parallel anyway. Promotion PRs (dev -> qa) are merged by humans, so
-#     that landing on qa triggers qa -> dev to return promotion-branch fixes.
+#     in parallel anyway. (If GITHUB_TOKEN is ever swapped for a PAT, note that
+#     a merge into qa would trigger qa -> dev; with GITHUB_TOKEN it terminates.)
+#     Promotion PRs (dev -> qa) are merged by humans, so that landing on qa
+#     triggers qa -> dev to return promotion-branch fixes.
 # Do not add dev as a source, and do not add main as a target.
 #
 # VERSION is handled by the same .github/scripts/promote.sh used by promote.yml
@@ -243,11 +245,17 @@ jobs:
             case "$rollup" in
               *IN_PROGRESS*|*QUEUED*|*PENDING*|*WAITING*|*REQUESTED*)
                 sleep 10; continue ;;
-              *FAILURE*|*TIMED_OUT*|*CANCELLED*|*ACTION_REQUIRED*)
+              *ACTION_REQUIRED*)
+                echo "::warning::#$NUM has parked/unapproved checks ($rollup); leaving it open for a human"
+                exit 0 ;;
+              *FAILURE*|*TIMED_OUT*|*CANCELLED*)
                 echo "::warning::#$NUM has failing checks ($rollup); leaving it open for a human"
                 exit 0 ;;
+              *SUCCESS*|*NEUTRAL*|*SKIPPED*|"")
+                break ;;
+              *)
+                break ;;
             esac
-            break
           done
 
           if gh pr merge "$NUM" --merge --delete-branch; then
