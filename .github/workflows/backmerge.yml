@@ -44,8 +44,10 @@ name: backmerge
 #     chain is main -> qa -> dev and then it stops.
 #   * In practice even that chain does not loop: a back-merge performed by
 #     GITHUB_TOKEN does not spawn new workflow runs, and main -> dev is opened
-#     in parallel anyway. Promotion PRs (dev -> qa) are merged by humans, so
-#     that landing on qa triggers qa -> dev to return promotion-branch fixes.
+#     in parallel anyway. (If GITHUB_TOKEN is ever swapped for a PAT, note that
+#     a merge into qa would trigger qa -> dev; with GITHUB_TOKEN it terminates.)
+#     Promotion PRs (dev -> qa) are merged by humans, so that landing on qa
+#     triggers qa -> dev to return promotion-branch fixes.
 # Do not add dev as a source, and do not add main as a target.
 #
 # VERSION is handled by the same .github/scripts/promote.sh used by promote.yml
@@ -121,7 +123,7 @@ jobs:
 
       - name: Build back-merge branch (code only, VERSION pinned to target)
         id: build
-        if: steps.exists.outputs.ok == 'true'
+        if: steps.check_source.outputs.match == 'true' && steps.exists.outputs.ok == 'true'
         env:
           SRC: ${{ matrix.source }}
           TGT: ${{ matrix.target }}
@@ -230,6 +232,8 @@ jobs:
           echo "auto-merge not armed: $(cat /tmp/automerge.err)"
 
           # Wait for the checks to settle before merging by hand.
+          settled=false
+          empty_count=0
           for _ in $(seq 1 60); do
             state=$(gh pr view "$NUM" --json state -q .state)
             if [ "$state" = "MERGED" ]; then
@@ -241,14 +245,39 @@ jobs:
             rollup=$(gh pr view "$NUM" --json statusCheckRollup \
                        -q '[.statusCheckRollup[]? | .conclusion // .status] | join(",")')
             case "$rollup" in
-              *IN_PROGRESS*|*QUEUED*|*PENDING*|*WAITING*|*REQUESTED*)
+              "")
+                empty_count=$((empty_count + 1))
+                if [ "$empty_count" -ge 6 ]; then
+                  echo "::notice::#$NUM has no checks after waiting; treating as check-free"
+                  settled=true
+                  break
+                fi
                 sleep 10; continue ;;
-              *FAILURE*|*TIMED_OUT*|*CANCELLED*|*ACTION_REQUIRED*)
+              *IN_PROGRESS*|*QUEUED*|*PENDING*|*WAITING*|*REQUESTED*)
+                empty_count=0
+                sleep 10; continue ;;
+              *ACTION_REQUIRED*)
+                echo "::warning::#$NUM has parked/unapproved checks ($rollup); leaving it open for a human"
+                exit 0 ;;
+              *FAILURE*|*TIMED_OUT*|*CANCELLED*|*STARTUP_FAILURE*|*STALE*|*ERROR*)
                 echo "::warning::#$NUM has failing checks ($rollup); leaving it open for a human"
                 exit 0 ;;
+              *)
+                empty_count=0
+                unknown=$(echo "$rollup" | tr ',' '\n' | grep -v -E '^(SUCCESS|NEUTRAL|SKIPPED)$' | paste -sd, - || true)
+                if [ -n "$unknown" ]; then
+                  echo "::warning::#$NUM has unrecognised check status ($unknown); leaving it open for a human"
+                  exit 0
+                fi
+                settled=true
+                break ;;
             esac
-            break
           done
+
+          if [ "$settled" != "true" ]; then
+            echo "::warning::timed out waiting for checks on #$NUM; leaving it open for a human"
+            exit 0
+          fi
 
           if gh pr merge "$NUM" --merge --delete-branch; then
             echo "::notice::merged #$NUM into $TGT"
