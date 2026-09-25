@@ -232,6 +232,8 @@ jobs:
           echo "auto-merge not armed: $(cat /tmp/automerge.err)"
 
           # Wait for the checks to settle before merging by hand.
+          settled=false
+          empty_count=0
           for _ in $(seq 1 60); do
             state=$(gh pr view "$NUM" --json state -q .state)
             if [ "$state" = "MERGED" ]; then
@@ -244,6 +246,12 @@ jobs:
                        -q '[.statusCheckRollup[]? | .conclusion // .status] | join(",")')
             case "$rollup" in
               "")
+                empty_count=$((empty_count + 1))
+                if [ "$empty_count" -ge 3 ]; then
+                  echo "::notice::#$NUM has no checks after waiting; treating as check-free"
+                  settled=true
+                  break
+                fi
                 sleep 10; continue ;;
               *IN_PROGRESS*|*QUEUED*|*PENDING*|*WAITING*|*REQUESTED*)
                 sleep 10; continue ;;
@@ -254,12 +262,18 @@ jobs:
                 echo "::warning::#$NUM has failing checks ($rollup); leaving it open for a human"
                 exit 0 ;;
               *SUCCESS*|*NEUTRAL*|*SKIPPED*)
+                settled=true
                 break ;;
               *)
                 echo "::warning::#$NUM has unrecognised check status ($rollup); leaving it open for a human"
                 exit 0 ;;
             esac
           done
+
+          if [ "$settled" != "true" ]; then
+            echo "::warning::timed out waiting for checks on #$NUM; leaving it open for a human"
+            exit 0
+          fi
 
           if gh pr merge "$NUM" --merge --delete-branch; then
             echo "::notice::merged #$NUM into $TGT"
