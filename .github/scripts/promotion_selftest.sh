@@ -110,6 +110,11 @@ cat > .github/scripts/bump_version.py <<'SAB'
 import sys
 open(sys.argv[1], "w").write("SABOTAGED\n")
 SAB
+cat > .github/scripts/promote.sh <<'SAB'
+#!/usr/bin/env bash
+echo "SABOTAGED" > VERSION
+exit 0
+SAB
 git commit -qam "qa: tooling that must never run"
 git push -q origin qa
 git checkout -q -B dev origin/dev
