@@ -64,8 +64,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # every remaining unit in one go. Re-exec so the running code is immutable.
 if [ -z "${PROMOTE_REEXEC:-}" ]; then
   PROMOTE_TMPDIR="$(mktemp -d)"
-  cp "$here/promote.sh" "$PROMOTE_TMPDIR/"
-  [ -f "$here/bump_version.py" ] && cp "$here/bump_version.py" "$PROMOTE_TMPDIR/"
+  cp -R "$here"/* "$PROMOTE_TMPDIR/"
   export PROMOTE_REEXEC=1 PROMOTE_TMPDIR
   exec bash "$PROMOTE_TMPDIR/promote.sh" "$@"
 fi
@@ -170,10 +169,11 @@ if [ "$SPLIT" = "1" ]; then
     echo "remaining=$remaining"
   } >> "$out"
   # Multi-line values need the heredoc form of the step-output protocol.
+  delim="PROMOTE_EOF_${RANDOM}_$$"
   {
-    echo "unit_subject<<PROMOTE_EOF"
+    echo "unit_subject<<$delim"
     echo "$unit_subject"
-    echo "PROMOTE_EOF"
+    echo "$delim"
   } >> "$out"
   echo "Promoting the oldest of ${#units[@]} un-promoted unit(s): ${unit_pr:+#$unit_pr }$unit_subject"
   echo "  up to $remaining further unit(s) will follow in later runs"
