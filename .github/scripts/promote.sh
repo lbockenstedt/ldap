@@ -84,9 +84,9 @@ fi
 [ "${#units[@]}" -gt 0 ] || units=("origin/$SRC")
 
 # Build $BR as "$TGT plus everything up to <endpoint>", VERSION pinned.
-# Returns 0 when that produced a real change and 1 when it is a content no-op.
-# A merge conflict outside VERSION does not return: it prints ::error:: and
-# exits the whole script, leaving the conflict for a human.
+# Returns 0 when that produced a real change, 1 when it is a content no-op,
+# and 2 on a merge conflict outside VERSION. Severity of a conflict is decided
+# by the caller.
 stage_to() {
   local endpoint="$1"
 
@@ -133,10 +133,11 @@ stage_to() {
 
 picked=""
 picked_idx=0
-conflicted=0
+last_rc=1
 for i in "${!units[@]}"; do
   sel_rc=0
   stage_to "${units[$i]}" || sel_rc=$?
+  last_rc="$sel_rc"
   if [ "$sel_rc" -eq 0 ]; then
     picked="${units[$i]}"
     picked_idx="$i"
@@ -157,7 +158,6 @@ for i in "${!units[@]}"; do
     # conflicted against it forever -- even after a back-merge had made the
     # full $SRC -> $TGT merge clean. tsa failed this way every run while
     # `git merge origin/qa` into main succeeded by hand.
-    conflicted=1
     echo "::warning::unit ${units[$i]} conflicts against $TGT in isolation --" \
          "batching it with the next unit"
     continue
@@ -165,11 +165,11 @@ for i in "${!units[@]}"; do
   [ "$SPLIT" = "1" ] && echo "  skipping ${units[$i]} -- no content change against $TGT (VERSION-only?)"
 done
 
-# Every endpoint conflicted, including the tip of $SRC. That is a real
+# The final endpoint (the tip of $SRC) conflicted. That is a real
 # divergence a human must reconcile -- and it must NOT fall through to the
 # "Nothing to promote" branch below, which would report success while
 # promoting nothing.
-if [ -z "$picked" ] && [ "$conflicted" -eq 1 ]; then
+if [ -z "$picked" ] && [ "$last_rc" -eq 2 ]; then
   echo "::error::merge conflict outside VERSION -- resolve $SRC -> $TGT by hand"
   exit 1
 fi
@@ -221,12 +221,35 @@ if [ "$SPLIT" = "1" ]; then
          "file(s); promoting an already-superseded version would be rejected"
     ext_rc=0
     stage_to "${units[$ext_idx]}" || ext_rc=$?
-    if [ "$ext_rc" -eq 0 ]; then
+    if [ "$ext_rc" -eq 2 ]; then
+      # The extension conflicts against $TGT. Falling back to the original
+      # unit would promote a known-superseded state, so advance to later
+      # cumulative endpoints instead, and fail if none merges cleanly.
+      echo "::warning::extension to ${units[$ext_idx]} conflicts against $TGT -- trying later units"
+      k=$(( ext_idx + 1 ))
+      found=0
+      while [ "$k" -lt "${#units[@]}" ]; do
+        k_rc=0
+        stage_to "${units[$k]}" || k_rc=$?
+        if [ "$k_rc" -eq 0 ]; then
+          found=1
+          break
+        fi
+        k=$(( k + 1 ))
+      done
+      if [ "$found" -ne 1 ]; then
+        echo "::error::merge conflict outside VERSION extending unit $picked_idx --" \
+             "resolve $SRC -> $TGT by hand"
+        exit 1
+      fi
+      picked="${units[$k]}"
+      picked_idx="$k"
+    elif [ "$ext_rc" -eq 0 ]; then
       picked="${units[$ext_idx]}"
       picked_idx="$ext_idx"
     else
-      # Only a no-op (1) can reach here; a conflict already exited inside
-      # stage_to. Not expected (a superset of a real change is a real change).
+      # Only a no-op (1) reaches here; conflicts are handled above.
+      # Not expected (a superset of a real change is a real change).
       echo "::warning::extension to ${units[$ext_idx]} was a content no-op -- keeping unit $picked_idx"
       # The worktree is staged against the extension endpoint, so restage the
       # original unit, and refuse to commit if that no longer yields a change.
