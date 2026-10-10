@@ -126,5 +126,7 @@ Two modes, mirroring `netbox/install.sh`: by default it installs the **spoke** t
 | `--entra-key` | Path to its private key. |
 | `--entra-scope` | OAuth scope requested from Entra. |
 
+**Auto-clustering (hub-driven):** `--server-id`/`--peer` are flags the installer accepts, but an operator loading the **`ldap-server`** role from the hub's WebUI (Load Role) normally never has to set them by hand. When a second `ldap-server` is loaded on a different agent in the same tenant, the hub (`core/src/routes/agents.py::_auto_cluster_ldap_server_config`) detects the existing one, assigns the two nodes distinct server-ids, points each at the other's `--peer` URL, copies the EXISTING node's `base_dn`/`admin_dn`/`admin_pw` onto the new node (read back from its `.env` so both nodes share one bind identity), and re-pushes a `force`d `LOAD_ROLE` to the existing node so both sides get mirror config from one action. Explicit `server_id`/`peers` passed in the Load Role config are never overridden; 3+ nodes in one tenant are left for manual configuration.
+
 **Environment overrides:** `HUB_URL` (same normalization as `--hub`), `SPOKE_ID`., `BASE_DN`, `ADMIN_DN`, `ADMIN_PW`, `HUB_SECRET`
 <!-- INSTALLERS:END -->
