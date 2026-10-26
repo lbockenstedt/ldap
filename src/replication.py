@@ -13,9 +13,10 @@ node carries a distinct ``olcServerID`` (1 or 2) so change sequence numbers
 
 The applied LDIF is idempotent by construction: ``olcServerID`` /
 ``olcMirrorMode`` use ``replace:`` (works whether or not the attr exists), the
-``syncprov`` overlay add tolerates "already exists", and ``olcSyncrepl`` is
-deleted-then-re-added so re-running with changed peers converges rather than
-accreting stale ``rid`` entries.
+``syncprov`` module load / overlay add tolerate "already exists", and
+``olcSyncrepl`` uses ``replace:`` so re-running with changed peers converges
+rather than accreting stale ``rid`` entries (and the very first run works —
+``delete:`` of a missing attribute is rejected by slapd).
 """
 from __future__ import annotations
 
@@ -49,6 +50,18 @@ def build_serverid_ldif(server_id: int) -> str:
     ]) + "\n"
 
 
+def build_syncprov_module_ldif() -> str:
+    """Load the ``syncprov`` module (Debian's slapd ships it as a module that
+    is NOT loaded by default, so the overlay add fails without this). The
+    caller ignores "value already exists" (20) on re-runs."""
+    return "\n".join([
+        "dn: cn=module{0},cn=config",
+        "changetype: modify",
+        "add: olcModuleLoad",
+        "olcModuleLoad: syncprov",
+    ]) + "\n"
+
+
 def build_syncprov_overlay_ldif(db_dn: str = DEFAULT_DB_DN) -> str:
     """Add the ``syncprov`` overlay to the DB so this node can PROVIDE updates to
     its peer. Applied with ``changetype: add``; the caller ignores an
@@ -69,7 +82,8 @@ def build_syncrepl_ldif(server_id: int, peers, base_dn: str,
                         db_dn: str = DEFAULT_DB_DN) -> str:
     """Replace the DB's ``olcSyncrepl`` with one consumer block per peer.
 
-    Delete-then-add so re-running converges (no stale rids). Each block uses
+    ``replace:`` so re-running converges (no stale rids) and the first run
+    works when no ``olcSyncrepl`` exists yet. Each block uses
     ``refreshAndPersist`` (live change stream) with simple-bind creds. The
     ``rid`` is derived from this node's ``server_id`` and the peer index so the
     two nodes never collide on a rid. ``retry`` keeps a downed peer re-trying
@@ -86,7 +100,7 @@ def build_syncrepl_ldif(server_id: int, peers, base_dn: str,
         raise ValueError("at least one peer is required for mirror-mode")
 
     lines = [f"dn: {db_dn}", "changetype: modify",
-             "delete: olcSyncrepl", "-", "add: olcSyncrepl"]
+             "replace: olcSyncrepl"]
     for idx, peer in enumerate(peers):
         # rid must be unique per node and stable per peer; keep it small (<=999,
         # slapd's rid limit). e.g. node 1 → rid 101,102...; node 2 → 201,202...
@@ -137,6 +151,7 @@ def _main(argv) -> int:
 
     Usage:
       python3 -m src.replication serverid <id>
+      python3 -m src.replication syncprov-module
       python3 -m src.replication syncprov [db_dn]
       python3 -m src.replication syncrepl <id> <base_dn> <admin_dn> <admin_pw> <peer> [peer...]
       python3 -m src.replication mirrormode <true|false> [db_dn]
@@ -148,6 +163,8 @@ def _main(argv) -> int:
     try:
         if cmd == "serverid":
             sys.stdout.write(build_serverid_ldif(int(argv[2])))
+        elif cmd == "syncprov-module":
+            sys.stdout.write(build_syncprov_module_ldif())
         elif cmd == "syncprov":
             sys.stdout.write(build_syncprov_overlay_ldif(*(argv[2:3] or [])))
         elif cmd == "syncrepl":
