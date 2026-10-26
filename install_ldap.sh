@@ -213,6 +213,37 @@ setup_repo_and_venv() {
 # =============================================================================
 # INFRA-ONLY: provision the slapd SERVER (zero-CLI, idempotent)
 # =============================================================================
+# Apply an LDIF (stdin) to cn=config over ldapi as root (SASL EXTERNAL).
+# Re-runs are idempotent: "value already exists" (20) and "already exists" (68)
+# count as success. Any other failure is printed (never silently swallowed) and
+# returned, so callers decide whether it is fatal.
+apply_config_ldif() {
+    local out rc
+    out="$(ldapmodify -Q -Y EXTERNAL -H ldapi:/// 2>&1)" && rc=0 || rc=$?
+    case "$rc" in 0|20|68) return 0 ;; esac
+    echo "⚠️  ldapmodify (cn=config) failed rc=$rc: $out" >&2
+    return "$rc"
+}
+
+# slapd's Cyrus SASL config. mech_list MUST include EXTERNAL: every cn=config
+# change (root password, TLS, replication) and the hub's cert install use
+# `ldapmodify -Y EXTERNAL -H ldapi:///`, and a list of only "plain login" makes
+# slapd reject them after its next restart. PLAIN/LOGIN serve the Entra ROPC
+# pass-through via saslauthd. slapd reads this only at startup, so restart it
+# when the file changes.
+write_slapd_sasl_conf() {
+    local want
+    want="pwcheck_method: saslauthd
+mech_list: plain login external
+saslauthd_path: /var/run/saslauthd/mux"
+    mkdir -p /etc/ldap/sasl2
+    if [ "$(cat /etc/ldap/sasl2/slapd.conf 2>/dev/null)" != "$want" ]; then
+        printf '%s\n' "$want" > /etc/ldap/sasl2/slapd.conf
+        systemctl restart slapd >/dev/null 2>&1 || true
+        sleep 2
+    fi
+}
+
 provision_server() {
     [ -z "$BASE_DN" ]  && BASE_DN="$(derive_base_dn)"
     [ -z "$ADMIN_DN" ] && ADMIN_DN="cn=admin,$BASE_DN"
@@ -262,9 +293,15 @@ DEBCONF
     cd "$INSTALL_DIR/ldap"
 
     # 4. Enforce the admin rootDN/rootPW on the mdb DB (idempotent replace) — so
-    #    --admin-pw applies even when slapd pre-existed.
+    #    --admin-pw applies even when slapd pre-existed. Fatal on failure: the
+    #    hub has already stored this password in the vault.
+    write_slapd_sasl_conf
+    if ! ldapwhoami -Q -Y EXTERNAL -H ldapi:/// >/dev/null 2>&1; then
+        echo "❌ slapd rejects SASL EXTERNAL over ldapi:/// — cannot change cn=config." >&2
+        exit 1
+    fi
     local HASH; HASH="$(slappasswd -s "$ADMIN_PW")"
-    ldapmodify -Y EXTERNAL -H ldapi:/// >/dev/null 2>&1 <<LDIF || true
+    apply_config_ldif <<LDIF || { echo "❌ setting the admin password failed." >&2; exit 1; }
 dn: olcDatabase={1}mdb,cn=config
 changetype: modify
 replace: olcRootDN
@@ -308,7 +345,7 @@ LDIF
     echo "   LDAPS:     ldaps://$(hostname -f 2>/dev/null || hostname):636 (self-signed until INSTALL_CERT)"
     echo "   Base DN:   $BASE_DN"
     echo "   Admin DN:  $ADMIN_DN"
-    echo "   Admin PW:  $ADMIN_PW"
+    echo "   Admin PW:  (set — see .env; not printed so it stays out of deploy logs)"
     echo "   .env:      $INSTALL_DIR/ldap/.env (chmod 600)"
     echo "   Next: point the ldap (directory) spoke's connection at the URL/base/admin above."
     exit 0
@@ -329,7 +366,7 @@ configure_self_signed_tls() {
     if [ -f "$TLS_DIR/slapd-key.pem" ]; then
         chmod 600 "$TLS_DIR/slapd-key.pem"; chmod 644 "$TLS_DIR/slapd-cert.pem"
         chown openldap:openldap "$TLS_DIR"/slapd-*.pem 2>/dev/null || true
-        ldapmodify -Y EXTERNAL -H ldapi:/// >/dev/null 2>&1 <<LDIF || true
+        apply_config_ldif <<LDIF || echo "⚠️  TLS cert config not applied; LDAPS may be unavailable."
 dn: cn=config
 changetype: modify
 replace: olcTLSCertificateFile
@@ -352,7 +389,7 @@ configure_sasl_passthrough() {
     echo "🔗 Configuring Entra ROPC SASL pass-through..."
     # olcPasswordHash advertises {SSHA} + {SASL}; a user's userPassword of
     # {SASL}<upn> routes the bind check to Cyrus SASL.
-    ldapmodify -Y EXTERNAL -H ldapi:/// >/dev/null 2>&1 <<'LDIF' || true
+    apply_config_ldif <<'LDIF' || echo "⚠️  olcPasswordHash not applied; Entra pass-through binds may fail."
 dn: cn=config
 changetype: modify
 replace: olcPasswordHash
@@ -381,12 +418,7 @@ SASLD
     fi
 
     # slapd's Cyrus SASL app config: verify passwords via saslauthd.
-    mkdir -p /etc/ldap/sasl2
-    cat > /etc/ldap/sasl2/slapd.conf <<'SASLCONF'
-pwcheck_method: saslauthd
-mech_list: plain login
-saslauthd_path: /var/run/saslauthd/mux
-SASLCONF
+    write_slapd_sasl_conf
 
     # PAM service (named after slapd's SASL service) → run the ROPC bridge with
     # the password exposed on stdin (expose_authtok).
@@ -406,16 +438,15 @@ PAM
 # Configure 2-node syncrepl mirror-mode via the shared pure LDIF builders.
 configure_mirror_mode() {
     echo "🔁 Configuring syncrepl mirror-mode (server-id $SERVER_ID, ${#PEERS[@]} peer(s))..."
-    # syncprov overlay (PROVIDER role) — tolerate "already exists" for idempotency.
-    ./venv/bin/python3 -m src.replication syncprov \
-        | ldapmodify -Y EXTERNAL -H ldapi:/// >/dev/null 2>&1 || true
-    # serverID + syncrepl(consumer) + mirrormode.
-    ./venv/bin/python3 -m src.replication serverid "$SERVER_ID" \
-        | ldapmodify -Y EXTERNAL -H ldapi:/// >/dev/null 2>&1 || true
-    ./venv/bin/python3 -m src.replication syncrepl "$SERVER_ID" "$BASE_DN" "$ADMIN_DN" "$ADMIN_PW" "${PEERS[@]}" \
-        | ldapmodify -Y EXTERNAL -H ldapi:/// >/dev/null 2>&1 || true
-    ./venv/bin/python3 -m src.replication mirrormode true \
-        | ldapmodify -Y EXTERNAL -H ldapi:/// >/dev/null 2>&1 || true
+    # Order matters: module → overlay (provider) → serverID → syncrepl
+    # (consumer) → mirrormode. Fatal on failure so a broken replication setup
+    # is reported to the hub instead of a false "deployed successfully".
+    ./venv/bin/python3 -m src.replication syncprov-module | apply_config_ldif \
+        && ./venv/bin/python3 -m src.replication syncprov | apply_config_ldif \
+        && ./venv/bin/python3 -m src.replication serverid "$SERVER_ID" | apply_config_ldif \
+        && ./venv/bin/python3 -m src.replication syncrepl "$SERVER_ID" "$BASE_DN" "$ADMIN_DN" "$ADMIN_PW" "${PEERS[@]}" | apply_config_ldif \
+        && ./venv/bin/python3 -m src.replication mirrormode true | apply_config_ldif \
+        || { echo "❌ mirror-mode replication setup failed." >&2; exit 1; }
 }
 
 write_server_env() {
