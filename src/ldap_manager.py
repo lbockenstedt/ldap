@@ -1,6 +1,7 @@
 import ldap
 import ldap.filter
 import ldap.dn
+import ldap.modlist
 from typing import Any, Dict, List, Optional
 import base64
 import hashlib
@@ -20,6 +21,13 @@ except ImportError:  # loaded outside the src package (tests / bare import)
                          group_dn as build_group_dn)
 
 logger = logging.getLogger("LdapManager")
+
+
+def _add_entry(conn, dn: str, attrs: Dict[str, Any]) -> None:
+    """``add_s`` with an attribute dict. python-ldap's ``add_s`` takes a list of
+    ``(attr, values)`` tuples and rejects a dict with ``TypeError`` — so every
+    add goes through ``ldap.modlist.addModlist``."""
+    conn.add_s(dn, ldap.modlist.addModlist(attrs))
 
 # userPassword marker that routes a bind through Cyrus SASL → saslauthd → the
 # Entra ROPC bridge (see src/entra_ropc_auth.py). An Entra-backed user's
@@ -143,7 +151,7 @@ class LdapManager:
             'ou': [ou_name.encode('utf-8')]
         }
         try:
-            conn.add_s(dn, attrs)
+            _add_entry(conn, dn, attrs)
             return {"status": "SUCCESS", "dn": dn}
         except ldap.LDAPError as e:
             logger.error(f"Error creating OU {dn}: {e}")
@@ -179,7 +187,7 @@ class LdapManager:
             'userPassword': [self._ssha(user_password)]  # {SSHA}, not cleartext
         }
         try:
-            conn.add_s(dn, attrs)
+            _add_entry(conn, dn, attrs)
             # Return the generated/provided password so the operator can deliver it securely.
             return {"status": "SUCCESS", "dn": dn, "password": user_password}
         except ldap.LDAPError as e:
@@ -213,7 +221,7 @@ class LdapManager:
             'member': [self.base_dn.encode('utf-8')] # groupOfNames requires at least one member
         }
         try:
-            conn.add_s(dn, attrs)
+            _add_entry(conn, dn, attrs)
             return {"status": "SUCCESS", "dn": dn}
         except ldap.LDAPError as e:
             logger.error(f"Error creating group {dn}: {e}")
@@ -223,7 +231,7 @@ class LdapManager:
         """Add a member DN to the specified group entry."""
         conn = self._get_connection()
         try:
-            conn.modify_s(group_dn, ldap.MOD_ADD, [('member', [user_dn.encode('utf-8')])])
+            conn.modify_s(group_dn, [(ldap.MOD_ADD, 'member', [user_dn.encode('utf-8')])])
             return {"status": "SUCCESS"}
         except ldap.LDAPError as e:
             logger.error(f"Error adding user {user_dn} to group {group_dn}: {e}")
@@ -233,7 +241,7 @@ class LdapManager:
         """Remove a member DN from the specified group entry."""
         conn = self._get_connection()
         try:
-            conn.modify_s(group_dn, ldap.MOD_DELETE, [('member', [user_dn.encode('utf-8')])])
+            conn.modify_s(group_dn, [(ldap.MOD_DELETE, 'member', [user_dn.encode('utf-8')])])
             return {"status": "SUCCESS"}
         except ldap.LDAPError as e:
             logger.error(f"Error removing user {user_dn} from group {group_dn}: {e}")
@@ -323,7 +331,7 @@ class LdapManager:
     def _ensure_entry(self, conn, dn: str, attrs: Dict[str, Any]) -> None:
         """Add ``dn`` if absent; treat ALREADY_EXISTS as success (idempotent)."""
         try:
-            conn.add_s(dn, attrs)
+            _add_entry(conn, dn, attrs)
         except ldap.ALREADY_EXISTS:
             pass
 
@@ -407,7 +415,7 @@ class LdapManager:
             entry['userPassword'] = [self._ssha(result_pw)]
         try:
             with self._conn() as conn:
-                conn.add_s(dn, entry)
+                _add_entry(conn, dn, entry)
             out = {"status": "SUCCESS", "dn": dn, "auth_mode": auth_mode}
             if result_pw is not None:
                 out["password"] = result_pw
@@ -482,7 +490,7 @@ class LdapManager:
             return {"status": "ERROR", "message": str(e)}
         try:
             with self._conn() as conn:
-                conn.add_s(dn, {
+                _add_entry(conn, dn, {
                     'objectClass': [b'groupOfNames'],
                     'cn': [cn.encode('utf-8')],
                     'member': [self.base_dn.encode('utf-8')],
