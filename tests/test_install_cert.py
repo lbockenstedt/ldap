@@ -41,6 +41,9 @@ _ldap.dn.escape_dn_chars = lambda v: v  # identity stub (real one escapes DN cha
 sys.modules["ldap"] = _ldap
 sys.modules["ldap.filter"] = _ldap.filter
 sys.modules["ldap.dn"] = _ldap.dn
+_ldap.modlist = types.ModuleType("ldap.modlist")
+_ldap.modlist.addModlist = lambda entry: [(k, v) for k, v in entry.items() if v]
+sys.modules["ldap.modlist"] = _ldap.modlist
 
 SRC = _PXMX_ROOT / "src"
 _pkg = types.ModuleType("ldap_src_pkg")
