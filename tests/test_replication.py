@@ -37,7 +37,7 @@ def test_syncprov_overlay():
 def test_syncrepl_ldif_has_peer_and_creds():
     out = replication.build_syncrepl_ldif(1, PEERS, BASE, ADMIN, PW)
     assert "dn: olcDatabase={1}mdb,cn=config" in out
-    assert "delete: olcSyncrepl" in out and "add: olcSyncrepl" in out
+    assert "replace: olcSyncrepl" in out and "delete:" not in out
     assert 'provider="ldaps://ldap2.lm.local:636"' in out
     assert 'type=refreshAndPersist' in out
     assert f'binddn="{ADMIN}"' in out
@@ -75,5 +75,11 @@ def test_mirrormode_toggle():
 def test_full_mirror_ldif_combines_all():
     out = replication.build_full_mirror_ldif(1, PEERS, BASE, ADMIN, PW)
     assert "replace: olcServerID" in out
-    assert "add: olcSyncrepl" in out
+    assert "replace: olcSyncrepl" in out
     assert "olcMirrorMode: TRUE" in out
+
+
+def test_syncprov_module_load():
+    out = replication.build_syncprov_module_ldif()
+    assert "dn: cn=module{0},cn=config" in out
+    assert "add: olcModuleLoad" in out and "olcModuleLoad: syncprov" in out
