@@ -549,7 +549,12 @@ class LdapSpoke(BaseSpoke):
                 server_id, peers, base_dn, admin_dn, admin_pw)
         except (ValueError, TypeError, json.JSONDecodeError) as e:
             return f"replication config invalid: {str(e)[:120]}"
-        # syncprov overlay: tolerate "already exists" so re-runs are idempotent.
+        # syncprov module + overlay: tolerate "exists" so re-runs are idempotent
+        # (module load → "value exists", overlay add → "already exists").
+        err = await self._ldapmodify_tolerant(
+            replication.build_syncprov_module_ldif(), tolerate="exists")
+        if err:
+            return f"replication syncprov module load failed: {err[:160]}"
         err = await self._ldapmodify_tolerant(overlay, tolerate="already exists")
         if err:
             return f"replication syncprov apply failed: {err[:160]}"
