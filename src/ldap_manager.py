@@ -1,16 +1,29 @@
+"""LDAP directory management for the LDAP spoke.
+
+Wraps python-ldap with safe, tenant-aware helpers for organisational units,
+users, groups, passwords and Entra-backed ({SASL}) accounts. Every public
+method returns a status dictionary the spoke can relay to the hub.
+"""
+# python-ldap core API plus helpers for filter escaping, DN escaping and modlists.
 import ldap
 import ldap.filter
 import ldap.dn
 import ldap.modlist
+# Type hints only.
 from typing import Any, Dict, List, Optional
+# base64/hashlib build {SSHA} password hashes; os supplies random salt.
 import base64
 import hashlib
+# logging records LDAP errors.
 import logging
 import os
+# secrets generates strong random passwords when none is supplied.
 import secrets
+# contextmanager turns _conn into a with-statement that always unbinds.
 from contextlib import contextmanager
 
 # Pure DN builders (dependency-free) — shared, tested tenant-scoped DN math.
+# Package-relative import first; plain import when loaded outside the package.
 try:
     from .ldap_dn import (canonical_slug, tenant_ou_dn, users_container_dn,
                           groups_container_dn, user_dn as build_user_dn,
@@ -20,6 +33,7 @@ except ImportError:  # loaded outside the src package (tests / bare import)
                          groups_container_dn, user_dn as build_user_dn,
                          group_dn as build_group_dn)
 
+# One named logger for the LDAP manager.
 logger = logging.getLogger("LdapManager")
 
 
@@ -27,6 +41,7 @@ def _add_entry(conn, dn: str, attrs: Dict[str, Any]) -> None:
     """``add_s`` with an attribute dict. python-ldap's ``add_s`` takes a list of
     ``(attr, values)`` tuples and rejects a dict with ``TypeError`` — so every
     add goes through ``ldap.modlist.addModlist``."""
+    # Convert the dict into python-ldap's (attr, values) list and add the entry.
     conn.add_s(dn, ldap.modlist.addModlist(attrs))
 
 # userPassword marker that routes a bind through Cyrus SASL → saslauthd → the
@@ -65,6 +80,7 @@ class LdapManager:
 
     def __init__(self, admin_dn: str, admin_pw: str, base_dn: str, server_url: str = "ldap://localhost:389"):
         """Initialize LDAP directory manager with administrative bind credentials and base DN."""
+        # Remember the admin credentials, search base and server URL for later binds.
         self.admin_dn = admin_dn
         self.admin_pw = admin_pw
         self.base_dn = base_dn
@@ -72,8 +88,10 @@ class LdapManager:
 
     def _get_connection(self):
         """Create and bind a new LDAP client connection using admin credentials."""
+        # Open a client handle to the server and bind as admin.
         conn = ldap.initialize(self.server)
         self._bind(conn)
+        # The caller owns the connection from here on.
         return conn
 
     def _bind(self, conn) -> None:
@@ -85,8 +103,10 @@ class LdapManager:
         (it's not an ``LDAPError``), so a bind failure surfaces as a clean
         ``INVALID_CREDENTIALS`` envelope at the spoke, not a cryptic per-method
         log line or a control-plane traceback."""
+        # Simple bind with the admin DN and password.
         try:
             conn.simple_bind_s(self.admin_dn, self.admin_pw)
+        # Wrong password: raise an actionable error instead of the raw LDAP dict.
         except ldap.INVALID_CREDENTIALS as exc:
             raise LdapBindError(
                 "LDAP bind failed: invalid credentials — the LDAP_ADMIN_PW in "
@@ -99,10 +119,13 @@ class LdapManager:
         """Bound connection that is ALWAYS unbound afterwards — fixes the socket/FD
         leak from _get_connection (bound per call, never closed), which exhausted
         slapd's conn limit on a long-running spoke."""
+        # Open a client handle; bind inside the try so it is unbound even if bind fails.
         conn = ldap.initialize(self.server)
         try:
             self._bind(conn)
+            # Hand the bound connection to the with-block.
             yield conn
+        # Always unbind to release the socket, ignoring errors during cleanup.
         finally:
             try:
                 conn.unbind_s()
@@ -111,6 +134,7 @@ class LdapManager:
 
     def check_connection(self) -> bool:
         """Health check that binds + unbinds (no leak). Raises on failure."""
+        # Binding successfully is the health check; the context manager unbinds.
         with self._conn():
             return True
 
@@ -120,6 +144,7 @@ class LdapManager:
         injection — a name containing ``, + = \\ <`` (or a leading space) could
         otherwise reparent the entry (e.g. uid ``foo,ou=admins`` → placed under
         ``ou=admins``). The spoke binds as admin, so this is security-critical."""
+        # Delegate to python-ldap's RFC 4514 escaper (None treated as empty).
         return ldap.dn.escape_dn_chars(value or "")
 
     @staticmethod
@@ -127,29 +152,38 @@ class LdapManager:
         """{SSHA} hash for ``userPassword``. slapd does NOT hash a plain add/modify
         of userPassword (only the Password-Modify ext-op does), so hash before
         storing to avoid cleartext passwords at rest."""
+        # Four random salt bytes, SHA-1 over password+salt, then base64(digest+salt).
         salt = os.urandom(4)
         digest = hashlib.sha1(password.encode('utf-8') + salt).digest()
         return b'{SSHA}' + base64.b64encode(digest + salt)
 
     def list_ous(self) -> List[Dict[str, Any]]:
         """List all Organizational Unit entries located beneath the base DN."""
+        # Search the whole subtree for OUs, then release the connection.
         with self._conn() as conn:
             results = conn.search_s(self.base_dn, ldap.SCOPE_SUBTREE, "(objectClass=organizationalUnit)", ['ou', 'description'])
+        # Convert each result into {name, dn}.
         ous = []
         for dn, attrs in results:
+            # Skip referral entries, which have no DN.
             if dn:
+                # Use the ou attribute, or the first RDN value when the attribute is missing.
                 ou_name = attrs.get('ou', [b''])[0].decode('utf-8') if attrs.get('ou') else dn.split(',')[0].split('=')[-1]
                 ous.append({"name": ou_name, "dn": dn})
+        # Return the OU list.
         return ous
 
     def create_ou(self, ou_name: str, parent_dn: str = None) -> Dict[str, Any]:
         """Create a new Organizational Unit entry with escaped RDN under the parent DN."""
+        # Bind, then build the OU's DN (escaped name) under the parent or the base DN.
         conn = self._get_connection()
         dn = f"ou={self._escape_rdn(ou_name)},{parent_dn if parent_dn else self.base_dn}"
+        # Minimal attributes for an organizationalUnit entry.
         attrs = {
             'objectClass': [b'organizationalUnit'],
             'ou': [ou_name.encode('utf-8')]
         }
+        # Create the entry; LDAP errors are logged and returned as an ERROR result.
         try:
             _add_entry(conn, dn, attrs)
             return {"status": "SUCCESS", "dn": dn}
@@ -159,25 +193,33 @@ class LdapManager:
 
     def list_users(self) -> List[Dict[str, Any]]:
         """Search and return all person objects under the directory base DN."""
+        # Search the whole subtree for person entries, then release the connection.
         with self._conn() as conn:
             results = conn.search_s(self.base_dn, ldap.SCOPE_SUBTREE, "(objectClass=person)", ['uid', 'cn', 'sn', 'givenName', 'mail'])
+        # Convert each result into a user dictionary.
         users = []
         for dn, attrs in results:
+            # Skip referral entries, which have no DN.
             if dn:
+                # Decode each attribute, with sensible fallbacks when one is missing.
                 uid = attrs.get('uid', [b''])[0].decode('utf-8') if attrs.get('uid') else dn.split(',')[0].split('=')[-1]
                 cn = attrs.get('cn', [b''])[0].decode('utf-8') if attrs.get('cn') else ''
                 sn = attrs.get('sn', [b''])[0].decode('utf-8') if attrs.get('sn') else ''
                 given = attrs.get('givenName', [b''])[0].decode('utf-8') if attrs.get('givenName') else cn.split(' ')[0] if cn else ''
                 mail = attrs.get('mail', [b''])[0].decode('utf-8') if attrs.get('mail') else ''
+                # Add the normalised user.
                 users.append({"username": uid, "cn": cn, "first_name": given, "last_name": sn, "email": mail, "dn": dn})
+        # Return the user list.
         return users
 
     def create_user(self, username: str, first_name: str, last_name: str, email: str, ou_dn: str, password: Optional[str] = None) -> Dict[str, Any]:
         """Create an inetOrgPerson user entry with {SSHA}-hashed password."""
+        # Bind, then build the user's DN (escaped uid) inside the given OU.
         conn = self._get_connection()
         dn = f"uid={self._escape_rdn(username)},{ou_dn}"
         # Use a caller-provided password, or generate a strong random one (never a hardcoded default).
         user_password = password or secrets.token_urlsafe(16)
+        # inetOrgPerson attributes; the password is stored as an {SSHA} hash.
         attrs = {
             'objectClass': [b'top', b'person', b'organizationalPerson', b'inetOrgPerson'],
             'cn': [f"{first_name} {last_name}".encode('utf-8')],
@@ -186,6 +228,7 @@ class LdapManager:
             'mail': [email.encode('utf-8')],
             'userPassword': [self._ssha(user_password)]  # {SSHA}, not cleartext
         }
+        # Create the entry; LDAP errors are logged and returned as an ERROR result.
         try:
             _add_entry(conn, dn, attrs)
             # Return the generated/provided password so the operator can deliver it securely.
@@ -196,30 +239,39 @@ class LdapManager:
 
     def list_groups(self) -> List[Dict[str, Any]]:
         """List all groupOfNames and posixGroup entries with their members."""
+        # Search the whole subtree for both group types, then release the connection.
         with self._conn() as conn:
             results = conn.search_s(self.base_dn, ldap.SCOPE_SUBTREE, "(|(objectClass=groupOfNames)(objectClass=posixGroup))", ['cn', 'member', 'memberUid', 'description'])
+        # Convert each result into a group dictionary with its members.
         groups = []
         for dn, attrs in results:
+            # Skip referral entries, which have no DN.
             if dn:
+                # Group name and member DNs.
                 cn = attrs.get('cn', [b''])[0].decode('utf-8') if attrs.get('cn') else ''
                 members = [m.decode('utf-8') for m in attrs.get('member', [])]
+                # Add the normalised group.
                 groups.append({
                     "name": cn,
                     "dn": dn,
                     "member_count": len(members),
                     "members": members,
                 })
+        # Return the group list.
         return groups
 
     def create_group(self, group_name: str, ou_dn: str) -> Dict[str, Any]:
         """Create a new groupOfNames entry seeded with a base DN member."""
+        # Bind, then build the group's DN (escaped name) inside the given OU.
         conn = self._get_connection()
         dn = f"cn={self._escape_rdn(group_name)},{ou_dn}"
+        # groupOfNames attributes, seeded with a placeholder member.
         attrs = {
             'objectClass': [b'groupOfNames'],
             'cn': [group_name.encode('utf-8')],
             'member': [self.base_dn.encode('utf-8')] # groupOfNames requires at least one member
         }
+        # Create the entry; LDAP errors are logged and returned as an ERROR result.
         try:
             _add_entry(conn, dn, attrs)
             return {"status": "SUCCESS", "dn": dn}
@@ -229,26 +281,31 @@ class LdapManager:
 
     def add_user_to_group(self, user_dn: str, group_dn: str) -> Dict[str, Any]:
         """Add a member DN to the specified group entry."""
+        # Bind, then add the user's DN to the group's member attribute.
         conn = self._get_connection()
         try:
             conn.modify_s(group_dn, [(ldap.MOD_ADD, 'member', [user_dn.encode('utf-8')])])
             return {"status": "SUCCESS"}
+        # LDAP error (e.g. already a member): log and report it.
         except ldap.LDAPError as e:
             logger.error(f"Error adding user {user_dn} to group {group_dn}: {e}")
             return {"status": "ERROR", "message": str(e)}
 
     def remove_user_from_group(self, user_dn: str, group_dn: str) -> Dict[str, Any]:
         """Remove a member DN from the specified group entry."""
+        # Bind, then delete the user's DN from the group's member attribute.
         conn = self._get_connection()
         try:
             conn.modify_s(group_dn, [(ldap.MOD_DELETE, 'member', [user_dn.encode('utf-8')])])
             return {"status": "SUCCESS"}
+        # LDAP error (e.g. not a member): log and report it.
         except ldap.LDAPError as e:
             logger.error(f"Error removing user {user_dn} from group {group_dn}: {e}")
             return {"status": "ERROR", "message": str(e)}
 
     def set_password(self, user_dn: str, new_password: str) -> Dict[str, Any]:
         """Set or update password for user DN using Password-Modify or attribute replacement."""
+        # Bind, then try the Password-Modify extended operation (the server hashes it).
         conn = self._get_connection()
         try:
             conn.passwd_s(user_dn, None, new_password.encode('utf-8'))
@@ -258,22 +315,26 @@ class LdapManager:
             try:
                 conn.modify_s(user_dn, [(ldap.MOD_REPLACE, 'userPassword', [self._ssha(new_password)])])
                 return {"status": "SUCCESS"}
+            # Both methods failed: log and report the error.
             except ldap.LDAPError as e:
                 logger.error(f"Error setting password for {user_dn}: {e}")
                 return {"status": "ERROR", "message": str(e)}
 
     def delete_entity(self, dn: str) -> Dict[str, Any]:
         """Delete an LDAP entry by distinguished name."""
+        # Bind, then delete the entry.
         conn = self._get_connection()
         try:
             conn.delete_s(dn)
             return {"status": "SUCCESS"}
+        # LDAP error (e.g. entry has children): log and report it.
         except ldap.LDAPError as e:
             logger.error(f"Error deleting entity {dn}: {e}")
             return {"status": "ERROR", "message": str(e)}
 
     def _rename(self, conn, dn: str, new_rdn: str) -> None:
         """Rename an entry's RDN (modrdn). The old RDN value is deleted."""
+        # Rename in place and drop the old RDN value from the entry.
         conn.rename_s(dn, new_rdn, delold=1)
 
     def migrate_tenant(self, source_base_dn: str, target_base_dn: str,
@@ -284,23 +345,29 @@ class LdapManager:
         ldap_base_dn changes. Optionally delete the now-empty source container.
         No-op when source == target or the source has no children. Returns the
         moved DNs; any per-entry error keeps the source (no purge)."""
+        # Normalise both DNs; both are required.
         source_base_dn = (source_base_dn or "").strip()
         target_base_dn = (target_base_dn or "").strip()
         if not source_base_dn or not target_base_dn:
             return {"status": "ERROR", "message": "source and target base DN are required"}
+        # Nothing to do when source and target are the same (case-insensitive).
         if source_base_dn.lower() == target_base_dn.lower():
             return {"status": "SUCCESS", "moved": [], "count": 0,
                     "message": "source and target base DN are the same"}
+        # Track the DNs that moved and per-entry failures.
         moved: List[str] = []
         errors: Dict[str, str] = {}
+        # One connection for the whole migration; it is always unbound.
         try:
             with self._conn() as conn:
                 try:
+                    # Find the source's direct children; a missing source means nothing to migrate.
                     children = conn.search_s(source_base_dn, ldap.SCOPE_ONELEVEL,
                                              "(objectClass=*)", ['dn'])
                 except ldap.NO_SUCH_OBJECT:
                     return {"status": "SUCCESS", "moved": [], "count": 0,
                             "message": f"source '{source_base_dn}' not found — nothing to migrate"}
+                # Move each child (and its subtree) under the target, keeping its RDN.
                 for dn, _attrs in children:
                     rdn = dn.split(",", 1)[0]
                     try:
@@ -309,14 +376,19 @@ class LdapManager:
                         conn.rename_s(dn, rdn, target_base_dn, 1)
                         moved.append(dn)
                     except ldap.LDAPError as e:
+                        # Record the failure and continue with the other children.
                         errors[dn] = str(e)
+                # Delete the empty source container only when every move succeeded.
                 if purge_source and not errors:
                     try:
                         conn.delete_s(source_base_dn)
                     except ldap.LDAPError as e:
+                        # Record the failure; the source is kept.
                         errors["delete_source"] = str(e)
         except Exception as e:  # noqa: BLE001
+            # Connection or bind failure: report it.
             return {"status": "ERROR", "message": str(e)}
+        # PARTIAL when any entry failed, with a human-readable summary.
         status = "SUCCESS" if not errors else "PARTIAL"
         return {"status": status, "moved": moved, "count": len(moved), "errors": errors,
                 "message": (f"moved {len(moved)} entry(ies) to '{target_base_dn}'"
@@ -330,21 +402,26 @@ class LdapManager:
 
     def _ensure_entry(self, conn, dn: str, attrs: Dict[str, Any]) -> None:
         """Add ``dn`` if absent; treat ALREADY_EXISTS as success (idempotent)."""
+        # Try to add the entry.
         try:
             _add_entry(conn, dn, attrs)
         except ldap.ALREADY_EXISTS:
+            # Already there: nothing to do.
             pass
 
     def _find_tenant_ou(self, conn, slug: str) -> Optional[str]:
         """Return the DN of an existing tenant OU for ``slug`` (case-insensitive),
         or None. ``ou`` uses caseIgnoreMatch, so a filter on the canonical slug
         matches an OU stored in ANY case ("LRB" finds "lrb")."""
+        # Escape the slug for the filter, then search one level below the base for the OU.
         safe = ldap.filter.escape_filter_chars(slug)
         try:
             res = conn.search_s(self.base_dn, ldap.SCOPE_ONELEVEL,
                                 f"(&(objectClass=organizationalUnit)(ou={safe}))", ['ou'])
         except ldap.NO_SUCH_OBJECT:
+            # Base DN missing: no tenant OU.
             return None
+        # Return the first real DN found, or None.
         for dn, _attrs in res:
             if dn:
                 return dn
@@ -354,10 +431,12 @@ class LdapManager:
         """Idempotently create ``ou=<slug>,<base>`` + child ``ou=users`` /
         ``ou=groups``. Case-insensitive: if an OU already exists for this tenant
         in ANY case, reuse it (never create a second). Returns the OU DN."""
+        # Normalise the tenant name to its canonical slug; reject invalid names.
         try:
             slug = canonical_slug(tenant_slug)
         except ValueError as e:
             return {"status": "ERROR", "message": str(e)}
+        # Reuse an existing OU in any case, otherwise create one with the canonical slug.
         try:
             with self._conn() as conn:
                 existing = self._find_tenant_ou(conn, slug)
@@ -376,6 +455,7 @@ class LdapManager:
                         'ou': [child_ou.encode('utf-8')],
                     })
             return {"status": "SUCCESS", "dn": ou_dn}
+        # LDAP error: log and report it.
         except ldap.LDAPError as e:
             logger.error(f"Error provisioning tenant OU '{tenant_slug}': {e}")
             return {"status": "ERROR", "message": str(e)}
@@ -389,30 +469,37 @@ class LdapManager:
         ``auth_mode="entra"`` → ``userPassword: {SASL}<upn>`` (no local secret;
         binds are validated against Entra via the ROPC bridge); ``"local"`` →
         ``{SSHA}`` of ``password`` (generated if omitted, returned once)."""
+        # Build the user's DN in the tenant's users container; reject invalid input.
         attrs = attrs or {}
         try:
             dn = build_user_dn(self.base_dn, uid, tenant_slug)
         except ValueError as e:
             return {"status": "ERROR", "message": str(e)}
+        # cn and sn are required by inetOrgPerson; fall back to mail or uid.
         cn = attrs.get('cn') or attrs.get('mail') or uid
         sn = attrs.get('sn') or attrs.get('cn') or uid
+        # Required inetOrgPerson attributes.
         entry: Dict[str, Any] = {
             'objectClass': [b'top', b'person', b'organizationalPerson', b'inetOrgPerson'],
             'cn': [str(cn).encode('utf-8')],
             'sn': [str(sn).encode('utf-8')],
             'uid': [uid.encode('utf-8')],
         }
+        # Copy the optional attributes that were supplied.
         for opt in ('givenName', 'mail', 'displayName', 'telephoneNumber', 'title'):
             if attrs.get(opt):
                 entry[opt] = [str(attrs[opt]).encode('utf-8')]
+        # Password: Entra users get a {SASL} marker, local users an {SSHA} hash.
         result_pw = None
         if auth_mode == "entra":
             entra_upn = upn or attrs.get('mail') or uid
             # {SASL}<upn> routes binds to saslauthd → Entra ROPC; no local pw.
             entry['userPassword'] = [f"{SASL_SCHEME}{entra_upn}".encode('utf-8')]
         else:
+            # Local user: use the supplied password or generate one, then hash it.
             result_pw = password or secrets.token_urlsafe(16)
             entry['userPassword'] = [self._ssha(result_pw)]
+        # Create the entry; return the password only for local users.
         try:
             with self._conn() as conn:
                 _add_entry(conn, dn, entry)
@@ -421,6 +508,7 @@ class LdapManager:
                 out["password"] = result_pw
             return out
         except ldap.LDAPError as e:
+            # LDAP error: log and report it.
             logger.error(f"Error creating user {dn}: {e}")
             return {"status": "ERROR", "message": str(e)}
 
@@ -428,28 +516,34 @@ class LdapManager:
                            tenant_slug: Optional[str] = None) -> Dict[str, Any]:
         """Replace supplied attributes on a tenant-scoped user (cn/sn/givenName/
         mail/displayName/...). Does not touch userPassword or the auth mode."""
+        # Build the user's DN; reject invalid input.
         attrs = attrs or {}
         try:
             dn = build_user_dn(self.base_dn, uid, tenant_slug)
         except ValueError as e:
             return {"status": "ERROR", "message": str(e)}
+        # Replace each supplied, non-None attribute.
         mods = []
         for key in ('cn', 'sn', 'givenName', 'mail', 'displayName',
                     'telephoneNumber', 'title'):
             if key in attrs and attrs[key] is not None:
                 mods.append((ldap.MOD_REPLACE, key, [str(attrs[key]).encode('utf-8')]))
+        # Nothing supplied: succeed without touching the directory.
         if not mods:
             return {"status": "SUCCESS", "dn": dn, "message": "no attributes to update"}
+        # Apply all changes in one modify.
         try:
             with self._conn() as conn:
                 conn.modify_s(dn, mods)
             return {"status": "SUCCESS", "dn": dn}
         except ldap.LDAPError as e:
+            # LDAP error: log and report it.
             logger.error(f"Error updating user {dn}: {e}")
             return {"status": "ERROR", "message": str(e)}
 
     def delete_user_scoped(self, uid: str, tenant_slug: Optional[str] = None) -> Dict[str, Any]:
         """Delete a tenant-scoped user by uid."""
+        # Build the user's DN and delete it through the generic helper.
         try:
             dn = build_user_dn(self.base_dn, uid, tenant_slug)
         except ValueError as e:
@@ -460,34 +554,42 @@ class LdapManager:
                             tenant_slug: Optional[str] = None) -> Dict[str, Any]:
         """Set a LOCAL user's password. Refuses Entra-backed users (their
         userPassword is ``{SASL}<upn>`` — they have no local secret to set)."""
+        # A new password is required.
         if not new_password:
             return {"status": "ERROR", "message": "password is required"}
+        # Build the user's DN; reject invalid input.
         try:
             dn = build_user_dn(self.base_dn, uid, tenant_slug)
         except ValueError as e:
             return {"status": "ERROR", "message": str(e)}
+        # Read the current userPassword to detect Entra-backed accounts.
         try:
             with self._conn() as conn:
                 cur = conn.search_s(dn, ldap.SCOPE_BASE, "(objectClass=*)", ['userPassword'])
+                # Refuse when any value is a {SASL} marker.
                 for _d, a in cur:
                     for val in a.get('userPassword', []):
                         if val.decode('utf-8', 'replace').startswith(SASL_SCHEME):
                             return {"status": "ERROR",
                                     "message": "user is Entra-backed (SASL); has no "
                                                "local password to set"}
+                # Local user: store the new password as an {SSHA} hash.
                 conn.modify_s(dn, [(ldap.MOD_REPLACE, 'userPassword', [self._ssha(new_password)])])
             return {"status": "SUCCESS", "dn": dn}
         except ldap.LDAPError as e:
+            # LDAP error: log and report it.
             logger.error(f"Error setting password for {dn}: {e}")
             return {"status": "ERROR", "message": str(e)}
 
     def create_group_scoped(self, cn: str, tenant_slug: Optional[str] = None) -> Dict[str, Any]:
         """Create a ``groupOfNames`` under a tenant's ``ou=groups``. Seeded with
         the base DN as a placeholder member (groupOfNames requires ≥1)."""
+        # Build the group's DN in the tenant's groups container; reject invalid input.
         try:
             dn = build_group_dn(self.base_dn, cn, tenant_slug)
         except ValueError as e:
             return {"status": "ERROR", "message": str(e)}
+        # Create the group with the base DN as its placeholder member.
         try:
             with self._conn() as conn:
                 _add_entry(conn, dn, {
@@ -497,11 +599,13 @@ class LdapManager:
                 })
             return {"status": "SUCCESS", "dn": dn}
         except ldap.LDAPError as e:
+            # LDAP error: log and report it.
             logger.error(f"Error creating group {dn}: {e}")
             return {"status": "ERROR", "message": str(e)}
 
     def delete_group_scoped(self, cn: str, tenant_slug: Optional[str] = None) -> Dict[str, Any]:
         """Delete a tenant-scoped group by cn (under the tenant's ou=groups)."""
+        # Build the group's DN and delete it through the generic helper.
         try:
             dn = build_group_dn(self.base_dn, cn, tenant_slug)
         except ValueError as e:
@@ -511,6 +615,7 @@ class LdapManager:
     def add_member_scoped(self, uid: str, group_cn: str,
                           tenant_slug: Optional[str] = None) -> Dict[str, Any]:
         """Add a tenant-scoped user to a tenant-scoped group."""
+        # Build both DNs, then reuse the generic membership helper.
         try:
             u_dn = build_user_dn(self.base_dn, uid, tenant_slug)
             g_dn = build_group_dn(self.base_dn, group_cn, tenant_slug)
@@ -521,6 +626,7 @@ class LdapManager:
     def remove_member_scoped(self, uid: str, group_cn: str,
                              tenant_slug: Optional[str] = None) -> Dict[str, Any]:
         """Remove a tenant-scoped user from a tenant-scoped group."""
+        # Build both DNs, then reuse the generic membership helper.
         try:
             u_dn = build_user_dn(self.base_dn, uid, tenant_slug)
             g_dn = build_group_dn(self.base_dn, group_cn, tenant_slug)
@@ -530,68 +636,88 @@ class LdapManager:
 
     def list_users_scoped(self, tenant_slug: Optional[str] = None) -> List[Dict[str, Any]]:
         """List users under a tenant's ``ou=users`` (or base level if no slug)."""
+        # Resolve the tenant's users container; an invalid tenant yields an empty list.
         try:
             search_base = users_container_dn(self.base_dn, tenant_slug)
         except ValueError:
             return []
+        # Search the container for person entries.
         try:
             with self._conn() as conn:
                 results = conn.search_s(search_base, ldap.SCOPE_SUBTREE,
                                         "(objectClass=person)",
                                         ['uid', 'cn', 'sn', 'givenName', 'mail', 'userPassword'])
+        # Container missing: no users.
         except ldap.NO_SUCH_OBJECT:
             return []
+        # Convert each result into a user dictionary.
         users = []
         for dn, attrs in results:
+            # Skip referral entries, which have no DN.
             if not dn:
                 continue
             def _d(k):
+                """Return the first value of attribute k as text, or an empty string."""
                 v = attrs.get(k, [b''])
                 return v[0].decode('utf-8', 'replace') if v and v[0] else ''
+            # Entra-backed users are recognised by the {SASL} password marker.
             pw = attrs.get('userPassword', [b''])
             is_entra = bool(pw and pw[0].decode('utf-8', 'replace').startswith(SASL_SCHEME))
+            # Add the normalised user, falling back to the RDN value for the username.
             users.append({
                 "username": _d('uid') or dn.split(',')[0].split('=')[-1],
                 "cn": _d('cn'), "first_name": _d('givenName'),
                 "last_name": _d('sn'), "email": _d('mail'), "dn": dn,
                 "auth_mode": "entra" if is_entra else "local",
             })
+        # Return the user list.
         return users
 
     def list_groups_scoped(self, tenant_slug: Optional[str] = None) -> List[Dict[str, Any]]:
         """List groups under a tenant's ``ou=groups`` (or base level if no slug)."""
+        # Resolve the tenant's groups container; an invalid tenant yields an empty list.
         try:
             search_base = groups_container_dn(self.base_dn, tenant_slug)
         except ValueError:
             return []
+        # Search the container for both group types.
         try:
             with self._conn() as conn:
                 results = conn.search_s(search_base, ldap.SCOPE_SUBTREE,
                                         "(|(objectClass=groupOfNames)(objectClass=posixGroup))",
                                         ['cn', 'member', 'memberUid'])
+        # Container missing: no groups.
         except ldap.NO_SUCH_OBJECT:
             return []
+        # Convert each result into a group dictionary.
         groups = []
         for dn, attrs in results:
+            # Skip referral entries, which have no DN.
             if not dn:
                 continue
+            # Group name, plus its members without the base-DN placeholder.
             cn = attrs.get('cn', [b''])[0].decode('utf-8', 'replace') if attrs.get('cn') else ''
             members = [m.decode('utf-8', 'replace') for m in attrs.get('member', [])
                        if m.decode('utf-8', 'replace') != self.base_dn]
+            # Add the normalised group.
             groups.append({"name": cn, "dn": dn, "member_count": len(members),
                            "members": members})
+        # Return the group list.
         return groups
 
     def get_user_groups(self, uid: str, tenant_slug: Optional[str] = None) -> Dict[str, Any]:
         """Return a user's group memberships — for hub RBAC. Reads the user's
         ``memberOf`` (if the memberof overlay is enabled) AND searches groups by
         ``member=<user_dn>`` (works without the overlay); the union is returned."""
+        # Build the user's DN and the tenant's groups container; reject invalid input.
         try:
             u_dn = build_user_dn(self.base_dn, uid, tenant_slug)
             groups_base = groups_container_dn(self.base_dn, tenant_slug)
         except ValueError as e:
             return {"status": "ERROR", "message": str(e)}
+        # Collect group DNs to names; a dict merges both lookups without duplicates.
         found: Dict[str, str] = {}  # dn -> cn
+        # One connection for both lookups; it is always unbound.
         try:
             with self._conn() as conn:
                 # memberOf on the user entry (present only with the memberof overlay).
@@ -600,6 +726,7 @@ class LdapManager:
                     for _d, a in ures:
                         for g in a.get('memberOf', []):
                             found.setdefault(g.decode('utf-8', 'replace'), '')
+                # The user does not exist.
                 except ldap.NO_SUCH_OBJECT:
                     return {"status": "ERROR", "message": f"user not found: {u_dn}"}
                 # Reverse search: groups that list this user as a member.
@@ -611,11 +738,14 @@ class LdapManager:
                         if gdn:
                             cn = a.get('cn', [b''])[0].decode('utf-8', 'replace') if a.get('cn') else ''
                             found[gdn] = cn or found.get(gdn, '')
+                # Groups container missing: only the memberOf results apply.
                 except ldap.NO_SUCH_OBJECT:
                     pass
+        # LDAP error: log and report it.
         except ldap.LDAPError as e:
             logger.error(f"Error getting groups for {u_dn}: {e}")
             return {"status": "ERROR", "message": str(e)}
+        # Build the result, falling back to the RDN value when the name is unknown.
         groups = [{"dn": dn, "name": cn or dn.split(',')[0].split('=')[-1]}
                   for dn, cn in found.items()]
         return {"status": "SUCCESS", "dn": u_dn, "groups": groups,
@@ -623,8 +753,10 @@ class LdapManager:
 
     def update_ou(self, dn: str, new_name: str) -> Dict[str, Any]:
         """Rename an OU. The new DN is derived from the new ou= RDN."""
+        # A new name is required.
         if not new_name:
             return {"status": "ERROR", "message": "new_name is required"}
+        # Bind, rename the RDN, then compute the new DN from the old parent.
         conn = self._get_connection()
         try:
             new_rdn = f"ou={self._escape_rdn(new_name)}"
@@ -632,6 +764,7 @@ class LdapManager:
             parent = dn.split(',', 1)[1] if ',' in dn else ''
             new_dn = f"{new_rdn},{parent}" if parent else new_rdn
             return {"status": "SUCCESS", "dn": new_dn}
+        # LDAP error: log and report it.
         except ldap.LDAPError as e:
             logger.error(f"Error renaming OU {dn}: {e}")
             return {"status": "ERROR", "message": str(e)}
@@ -640,8 +773,10 @@ class LdapManager:
                     email: str = None, username: str = None) -> Dict[str, Any]:
         """Update a user's attributes (cn/sn/givenName/mail) and optionally
         rename the uid RDN. None values are left untouched."""
+        # Bind, then collect a replace modification for each supplied field.
         conn = self._get_connection()
         mods = []
+        # cn is the full name, so it is updated only when both parts are given.
         if first_name is not None and last_name is not None:
             mods.append((ldap.MOD_REPLACE, 'cn', [f"{first_name} {last_name}".encode('utf-8')]))
         if first_name is not None:
@@ -650,6 +785,7 @@ class LdapManager:
             mods.append((ldap.MOD_REPLACE, 'sn', [last_name.encode('utf-8')]))
         if email is not None:
             mods.append((ldap.MOD_REPLACE, 'mail', [email.encode('utf-8')]))
+        # Apply attribute changes first, then rename the uid if it changed.
         try:
             if mods:
                 conn.modify_s(dn, mods)
@@ -662,14 +798,17 @@ class LdapManager:
                     parent = dn.split(',', 1)[1] if ',' in dn else ''
                     new_dn = f"uid={euid},{parent}" if parent else f"uid={euid}"
             return {"status": "SUCCESS", "dn": new_dn}
+        # LDAP error: log and report it.
         except ldap.LDAPError as e:
             logger.error(f"Error updating user {dn}: {e}")
             return {"status": "ERROR", "message": str(e)}
 
     def update_group(self, dn: str, new_name: str) -> Dict[str, Any]:
         """Rename a group (cn RDN)."""
+        # A new name is required.
         if not new_name:
             return {"status": "ERROR", "message": "new_name is required"}
+        # Bind, rename the RDN, then compute the new DN from the old parent.
         conn = self._get_connection()
         try:
             new_rdn = f"cn={self._escape_rdn(new_name)}"
@@ -677,6 +816,7 @@ class LdapManager:
             parent = dn.split(',', 1)[1] if ',' in dn else ''
             new_dn = f"{new_rdn},{parent}" if parent else new_rdn
             return {"status": "SUCCESS", "dn": new_dn}
+        # LDAP error: log and report it.
         except ldap.LDAPError as e:
             logger.error(f"Error renaming group {dn}: {e}")
             return {"status": "ERROR", "message": str(e)}
@@ -708,6 +848,7 @@ class LdapManager:
         spoke's ``_ldap_write``, which maps it to the clean
         ``INVALID_CREDENTIALS`` envelope (see memory
         ``ldap-bind-error-bypasses-per-method-catches``)."""
+        # An empty query returns no results.
         q = (query or "").strip()
         if not q:
             return {"status": "SUCCESS", "results": [], "count": 0}
@@ -733,6 +874,7 @@ class LdapManager:
             # Non-admin without a tenant scope gets nothing.
             return {"status": "SUCCESS", "results": [], "count": 0}
 
+        # Bind and search; LDAP errors become an ERROR result.
         results: List[Dict[str, Any]] = []
         try:
             conn = self._get_connection()
@@ -750,22 +892,29 @@ class LdapManager:
                 f"(|(cn=*{safe_q}*)(memberUid=*{safe_q}*)))"
                 ")"
             )
+            # Attributes needed to describe both users and groups.
             attrs = ['cn', 'uid', 'sn', 'givenName', 'mail', 'sAMAccountName',
                      'memberUid', 'member', 'description', 'objectClass']
             raw = conn.search_s(search_base, ldap.SCOPE_SUBTREE, ldap_filter, attrs)
+            # Convert each result into a user or group dictionary.
             for dn, entry in raw:
+                # Skip referral entries, which have no DN.
                 if not dn:
                     continue
+                # objectClass values as text, used to tell groups from users.
                 obj_classes = [c.decode() if isinstance(c, bytes) else c
                                for c in entry.get('objectClass', [])]
                 def _d(key: str) -> str:
+                    """Return the first value of an attribute as text, or an empty string."""
                     v = entry.get(key, [b''])[0]
                     return (v.decode('utf-8') if isinstance(v, bytes) else v) if v else ''
                 def _dl(key: str) -> List[str]:
+                    """Return every value of an attribute as text."""
                     out = []
                     for v in entry.get(key, []):
                         out.append(v.decode('utf-8') if isinstance(v, bytes) else v)
                     return out
+                # Groups: include both member DNs and memberUid values.
                 is_group = any(oc in obj_classes for oc in ('group', 'groupOfNames'))
                 if is_group:
                     members = _dl('member')
@@ -782,6 +931,7 @@ class LdapManager:
                         "member_count": len(members) + len(member_uids),
                     })
                 else:
+                    # Users: include name, username and mail fields.
                     results.append({
                         "source":     "ldap",
                         "type":       "user",
@@ -795,6 +945,7 @@ class LdapManager:
                         "surname":    _d('sn'),
                     })
         except ldap.LDAPError as e:
+            # LDAP error: log and report it.
             logger.error("LDAP search failed: %s", e)
             return {"status": "ERROR", "message": str(e), "results": []}
         # NOTE: LdapBindError intentionally NOT caught here — it propagates to
