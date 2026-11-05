@@ -1,23 +1,36 @@
+"""LDAP spoke: connects a local OpenLDAP (slapd) server to the hub.
+
+Turns hub commands into LdapManager calls for OUs, users, groups, passwords and
+tenant-scoped entries. It also handles config updates (Entra .env and mirror-mode
+replication) and installs TLS certificates into slapd.
+"""
+# asyncio runs blocking LDAP calls off the event loop; json/re/shutil/os help with files.
 import asyncio
 import json
 import logging
 import os
 import re
 import shutil
+# Path handles certificate and .env file locations; typing is for hints only.
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+# python-ldap is used here for its exception types.
 import ldap
+# BaseSpoke lives at the top level when deployed, or under core.src in the monorepo.
 try:
     from base_spoke import BaseSpoke
 except ImportError:
     from core.src.base_spoke import BaseSpoke
 
+# Directory operations and the bind-failure exception.
 from .ldap_manager import LdapManager, LdapBindError
+# Replication LDIF builders, imported package-relative or plain.
 try:
     from . import replication
 except ImportError:  # loaded outside the src package
     import replication
 
+# One named logger for the spoke.
 logger = logging.getLogger("LdapSpoke")
 
 
@@ -31,6 +44,7 @@ class LdapSpoke(BaseSpoke):
     """
     def __init__(self, spoke_id: str, config: Dict[str, Any], control_plane=None):
         """Initialize the LDAP spoke instance and instantiate LdapManager."""
+        # Base spoke setup, then a manager built from the config (with example defaults).
         super().__init__(spoke_id, config)
         self.manager = LdapManager(
             admin_dn=self.config.get("LDAP_ADMIN_DN", "cn=admin,dc=example,dc=org"),
@@ -54,6 +68,7 @@ class LdapSpoke(BaseSpoke):
         catches a propagating :class:`LdapBindError` (the manager raises it on
         bind failure instead of letting the cryptic dict get logged/returned
         per-method) here too."""
+        # Raw wrong-password error from python-ldap: log once and return a helpful hint.
         if isinstance(exc, ldap.INVALID_CREDENTIALS):
             msg = ("LDAP bind failed: invalid credentials — the LDAP_ADMIN_PW "
                    "in this spoke's config does not match slapd's admin "
@@ -62,6 +77,7 @@ class LdapSpoke(BaseSpoke):
             logger.warning("LDAP bind failed (invalid credentials): %s", msg)
             return {"status": "ERROR", "error": "INVALID_CREDENTIALS",
                     "message": msg}
+        # Bind error already raised by the manager with an actionable message.
         if isinstance(exc, LdapBindError):
             # The manager already formatted the actionable message; surface it
             # verbatim + log one WARNING line (replaces the per-method cryptic
@@ -69,6 +85,7 @@ class LdapSpoke(BaseSpoke):
             logger.warning("LDAP bind failed: %s", exc)
             return {"status": "ERROR", "error": "INVALID_CREDENTIALS",
                     "message": str(exc)}
+        # Any other LDAP error: return its type and message.
         return {"status": "ERROR", "message": f"{type(exc).__name__}: {exc}"}
 
     async def _ldap_list(self, fn, *args) -> Dict[str, Any]:
@@ -76,8 +93,10 @@ class LdapSpoke(BaseSpoke):
         :class:`LdapBindError` return a clean ERROR envelope instead of raising
         (avoids the per-call traceback dump from the control plane's
         ``logger.exception`` path)."""
+        # Run the blocking read in a thread and wrap its result as data.
         try:
             return {"status": "SUCCESS", "data": await asyncio.to_thread(fn, *args)}
+        # LDAP or bind failure: return a clean ERROR envelope instead of raising.
         except (ldap.LDAPError, LdapBindError) as exc:
             return self._ldap_error_envelope(exc)
 
@@ -98,8 +117,10 @@ class LdapSpoke(BaseSpoke):
         methods (bind inside the try) and the legacy ``_get_connection()``
         methods (bind outside the try, which used to propagate as a
         traceback)."""
+        # Run the blocking write in a thread; the manager returns its own status dict.
         try:
             return await asyncio.to_thread(fn, *args)
+        # Bind or uncaught LDAP failure: return a clean ERROR envelope.
         except (ldap.LDAPError, LdapBindError) as exc:
             return self._ldap_error_envelope(exc)
 
@@ -115,9 +136,11 @@ class LdapSpoke(BaseSpoke):
         # Normalize command type to uppercase for case-insensitive matching
         normalized_cmd = command_type.upper()
 
+        # GET_VERSION: report the spoke version.
         if normalized_cmd == "GET_VERSION":
             return {"status": "SUCCESS", "version": self.get_version()}
 
+        # UPDATE_CONFIG: take the new settings and rebuild the manager.
         if normalized_cmd == "UPDATE_CONFIG":
             # Redact secrets before logging (admin pw, entra client key/cert path
             # are sensitive-ish; the admin pw certainly).
@@ -130,6 +153,7 @@ class LdapSpoke(BaseSpoke):
                 base_dn=self.config.get("LDAP_BASE_DN", "dc=example,dc=org"),
                 server_url=self.config.get("LDAP_SERVER_URL", "ldap://localhost:389")
             )
+            # Collect notes about the extra side effects below.
             notes = []
             # Entra ROPC config changes: persist to .env so the pam_exec ROPC
             # bridge (src/entra_ropc_auth.py) picks them up on the next bind. No
@@ -147,6 +171,7 @@ class LdapSpoke(BaseSpoke):
             if data.get("LDAP_SERVER_ID") and data.get("LDAP_MIRROR_PEERS"):
                 repl = await self._apply_replication_config(data)
                 notes.append(repl)
+            # The config update itself always succeeds.
             return {"status": "SUCCESS", "message": "LDAP configuration updated",
                     "notes": notes}
 
@@ -154,6 +179,7 @@ class LdapSpoke(BaseSpoke):
         # run each in a worker thread — a slow/unreachable slapd must not stall the
         # asyncio event loop, which would freeze this spoke's heartbeats and get it
         # disconnected by the hub (and queue every other command behind it).
+        # Legacy commands that take explicit DNs.
         if normalized_cmd == "LIST_OUS":
             return await self._ldap_list(self.manager.list_ous)
 
@@ -163,6 +189,7 @@ class LdapSpoke(BaseSpoke):
         if normalized_cmd == "UPDATE_OU":
             return await self._ldap_write(self.manager.update_ou, data.get("dn"), data.get("name"))
 
+        # User listing and create/update by DN.
         if normalized_cmd == "LIST_USERS":
             return await self._ldap_list(self.manager.list_users)
 
@@ -178,6 +205,7 @@ class LdapSpoke(BaseSpoke):
                 data.get("dn"), data.get("first_name"), data.get("last_name"),
                 data.get("email"), data.get("username"))
 
+        # Group listing, create/rename and membership by DN.
         if normalized_cmd == "LIST_GROUPS":
             return await self._ldap_list(self.manager.list_groups)
 
@@ -193,6 +221,7 @@ class LdapSpoke(BaseSpoke):
         if normalized_cmd == "REMOVE_USER_FROM_GROUP":
             return await self._ldap_write(self.manager.remove_user_from_group, data.get("user_dn"), data.get("group_dn"))
 
+        # SET_PASSWORD: accept either key name for the DN and the password.
         if normalized_cmd == "SET_PASSWORD":
             user_dn = data.get("user_dn") or data.get("dn")
             password = data.get("password") or data.get("new_password")
@@ -200,6 +229,7 @@ class LdapSpoke(BaseSpoke):
                 return {"status": "ERROR", "message": "Missing user_dn or password"}
             return await self._ldap_write(self.manager.set_password, user_dn, password)
 
+        # DELETE_ENTITY: delete any entry by DN.
         if normalized_cmd == "DELETE_ENTITY":
             return await self._ldap_write(self.manager.delete_entity, data.get("dn"))
 
@@ -270,6 +300,7 @@ class LdapSpoke(BaseSpoke):
                 data.get("uid"), data.get("group") or data.get("cn"),
                 data.get("tenant_slug"))
 
+        # Tenant-scoped listings return data; the group lookup returns its own status.
         if normalized_cmd == "LDAP_LIST_USERS":
             return await self._ldap_list(self.manager.list_users_scoped, data.get("tenant_slug"))
 
@@ -295,11 +326,13 @@ class LdapSpoke(BaseSpoke):
                 data.get("fullchain", ""), data.get("privkey", ""),
                 ca_pem=data.get("chain", ""))
 
+        # Unknown command: log it and report an error.
         logger.warning(f"Unknown command received: {command_type}")
         return {"status": "ERROR", "message": f"Unknown command: {command_type}"}
 
     async def get_status(self) -> Dict[str, Any]:
         """Reports LDAP server status."""
+        # The check raises on failure, which is reported as UNHEALTHY.
         try:
             # Leak-free connectivity check (binds + unbinds), off the event loop.
             # NOTE: deliberately asyncio.to_thread (NOT _ldap_write) — a bind
@@ -313,6 +346,7 @@ class LdapSpoke(BaseSpoke):
 
     def get_version(self) -> str:
         """Returns the current version of the LDAP module (from the VERSION file)."""
+        # Read VERSION from the module root; fall back to "unknown".
         from pathlib import Path
         try:
             return (Path(__file__).parent.parent / "VERSION").read_text().strip()
@@ -335,11 +369,14 @@ class LdapSpoke(BaseSpoke):
         The leaf (first CERTIFICATE block) goes to olcTLSCertificateFile; the
         remaining blocks go to the CA bundle (olcTLSCACertificateFile). Order
         in the CA bundle is not significant per the OpenLDAP admin guide."""
+        # Pull every PEM certificate block out of the chain text.
         blocks = re.findall(
             r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
             (fullchain or "").strip(), re.DOTALL)
+        # No certificates found.
         if not blocks:
             return "", []
+        # First block is the leaf; the rest go to the CA bundle.
         return blocks[0] + "\n", [b + "\n" for b in blocks[1:]]
 
     @staticmethod
@@ -348,6 +385,7 @@ class LdapSpoke(BaseSpoke):
         """LDIF to replace slapd's olcTLS* file paths on cn=config. Uses
         ``replace:`` (idempotent — works whether or not the attrs already
         exist; ``add:`` would fail with 'Type or value exists' on a renew)."""
+        # Replace the certificate and key paths on cn=config.
         blocks = [
             "dn: cn=config",
             "changetype: modify",
@@ -357,9 +395,11 @@ class LdapSpoke(BaseSpoke):
             "replace: olcTLSCertificateKeyFile",
             f"olcTLSCertificateKeyFile: {key_path}",
         ]
+        # Also point at the CA bundle when there is one.
         if ca_path:
             blocks += ["-", "replace: olcTLSCACertificateFile",
                        f"olcTLSCACertificateFile: {ca_path}"]
+        # Join the lines into LDIF text.
         return "\n".join(blocks) + "\n"
 
     async def install_cert(self, fullchain: str, privkey: str,
@@ -373,6 +413,7 @@ class LdapSpoke(BaseSpoke):
         reads — it is never logged. Paths/owner/restart are configurable via
         LDAP_TLS_DIR / LDAP_TLS_CERT / LDAP_TLS_KEY / LDAP_TLS_CA /
         LDAP_SLAPD_USER / LDAP_TLS_RESTART."""
+        # Reject empty or obviously invalid certificate and key PEMs.
         fullchain = (fullchain or "").strip()
         privkey = (privkey or "").strip()
         if not fullchain or "BEGIN CERTIFICATE" not in fullchain:
@@ -380,16 +421,19 @@ class LdapSpoke(BaseSpoke):
         if not privkey or "PRIVATE KEY" not in privkey:
             return {"status": "ERROR", "message": "missing or invalid private key PEM"}
 
+        # Resolve file paths, the slapd user and the restart flag from config.
         cfg = self.config or {}
         cert_dir = cfg.get("LDAP_TLS_DIR", "/etc/ldap/tls")
         cert_path = cfg.get("LDAP_TLS_CERT", f"{cert_dir}/slapd-cert.pem")
         key_path = cfg.get("LDAP_TLS_KEY", f"{cert_dir}/slapd-key.pem")
         slapd_user = cfg.get("LDAP_SLAPD_USER", "openldap")
         do_restart = cfg.get("LDAP_TLS_RESTART", True)
+        # Split the leaf from intermediates and add any extra CA chain.
         leaf, cas = self._split_chain(fullchain)
         ca_blocks = cas + ([ca_pem.strip()] if ca_pem and ca_pem.strip() else [])
         ca_path = cfg.get("LDAP_TLS_CA", f"{cert_dir}/slapd-ca.pem") if ca_blocks else None
 
+        # Write the files; any failure becomes an ERROR result.
         try:
             os.makedirs(cert_dir, exist_ok=True)
             self._write_pem(cert_path, leaf, 0o644)
@@ -406,6 +450,7 @@ class LdapSpoke(BaseSpoke):
                 logger.warning("INSTALL_CERT: could not chown key to '%s' (%s); "
                                "slapd may fail to read it (error 80)", slapd_user, e)
 
+            # Point slapd at the files, then restart so it loads them.
             ldif = self._build_tls_ldif(cert_path, key_path, ca_path)
             await self._ldapmodify(ldif)
 
@@ -414,8 +459,10 @@ class LdapSpoke(BaseSpoke):
             logger.info("INSTALL_CERT: slapd TLS cert installed (cert=%s)", cert_path)
             return {"status": "SUCCESS",
                     "message": f"slapd TLS cert installed ({cert_path})"}
+        # Known install step failure: report its message.
         except _CertInstallError as e:
             return {"status": "ERROR", "message": str(e)}
+        # Unexpected failure: report a shortened message.
         except Exception as e:  # noqa: BLE001
             return {"status": "ERROR", "message": f"install_cert failed: {str(e)[:300]}"}
 
@@ -427,11 +474,13 @@ class LdapSpoke(BaseSpoke):
         # mid-write leaves the old file intact, not a truncated cert/key).
         tmp = f"{path}.tmp"
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        # Write the content, set the exact mode, then swap the file into place.
         try:
             with os.fdopen(fd, "w") as f:
                 f.write(content)
             os.chmod(tmp, mode)  # os.open honors umask; enforce the exact mode
             os.replace(tmp, path)
+        # Remove the partial temp file, then re-raise the error.
         except Exception:
             try:
                 os.unlink(tmp)
@@ -442,14 +491,17 @@ class LdapSpoke(BaseSpoke):
     async def _ldapmodify(self, ldif: str) -> None:
         """Apply an LDIF to cn=config via SASL EXTERNAL over ldapi:/// (root
         peer-cred → cn=config write). Raises _CertInstallError on failure."""
+        # Run ldapmodify with root's EXTERNAL identity over the local socket.
         proc = await asyncio.create_subprocess_exec(
             "ldapmodify", "-Y", "EXTERNAL", "-H", "ldapi:///",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        # Feed the LDIF on stdin, waiting up to 30 seconds.
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(input=ldif.encode()), timeout=30)
+        # Non-zero exit: raise with stderr, stdout or the exit code.
         if proc.returncode != 0:
             err = (stderr.decode().strip() or stdout.decode().strip()
                    or f"ldapmodify exited {proc.returncode}")
@@ -458,12 +510,15 @@ class LdapSpoke(BaseSpoke):
     async def _restart_slapd(self) -> None:
         """Restart slapd so the new TLS context takes effect (OpenLDAP ITS#6135:
         global TLS settings via cn=config only reliably apply on restart)."""
+        # Restart slapd with systemctl.
         proc = await asyncio.create_subprocess_exec(
             "systemctl", "restart", "slapd",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        # Wait up to 45 seconds.
         _, stderr = await asyncio.wait_for(proc.communicate(), timeout=45)
+        # Non-zero exit: raise with stderr or the exit code.
         if proc.returncode != 0:
             err = stderr.decode().strip() or f"systemctl exited {proc.returncode}"
             raise _CertInstallError(f"slapd restart failed: {err[:300]}")
@@ -480,12 +535,14 @@ class LdapSpoke(BaseSpoke):
 
     def _env_path(self) -> str:
         """Return absolute path to .env file for configuration persistence."""
+        # LDAP_ENV_PATH overrides the default .env in the module root.
         return os.environ.get("LDAP_ENV_PATH") or str(Path(__file__).parent.parent / ".env")
 
     def _persist_env(self, data: Dict[str, Any]) -> None:
         """Merge the persist-worthy keys from ``data`` into the module ``.env``
         (preserving all other lines), then re-chmod 0600. Only keys present in
         ``data`` are updated; ``LDAP_MIRROR_PEERS`` is JSON-serialised if a list."""
+        # Pick the persisted keys present in data; peer lists are stored as JSON.
         path = self._env_path()
         updates = {}
         for k in self._ENV_PERSIST_KEYS:
@@ -494,12 +551,15 @@ class LdapSpoke(BaseSpoke):
                 if k == "LDAP_MIRROR_PEERS" and isinstance(v, (list, tuple)):
                     v = json.dumps(list(v))
                 updates[k] = str(v)
+        # Nothing to persist.
         if not updates:
             return
+        # Read the existing .env lines, if any.
         lines = []
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8") as fh:
                 lines = fh.read().splitlines()
+        # Replace matching keys in place and keep every other line as-is.
         seen = set()
         out = []
         for line in lines:
@@ -509,9 +569,11 @@ class LdapSpoke(BaseSpoke):
                 seen.add(key)
             else:
                 out.append(line)
+        # Append keys that were not already in the file.
         for k, v in updates.items():
             if k not in seen:
                 out.append(f"{k}={v}")
+        # Write a 0600 temp file, then swap it into place.
         tmp = f"{path}.tmp"
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as fh:
@@ -523,9 +585,11 @@ class LdapSpoke(BaseSpoke):
         """Like ``_ldapmodify`` but returns an error string instead of raising,
         and treats an error whose text contains ``tolerate`` (e.g. "already
         exists") as success (returns None)."""
+        # Apply the LDIF; success returns None.
         try:
             await self._ldapmodify(ldif)
             return None
+        # Tolerated errors count as success; others are returned as text.
         except _CertInstallError as e:
             msg = str(e)
             if tolerate and tolerate.lower() in msg.lower():
@@ -536,6 +600,7 @@ class LdapSpoke(BaseSpoke):
         """Re-apply syncrepl mirror-mode to cn=config idempotently (best-effort;
         requires co-location on the slapd host as root via ldapi EXTERNAL).
         Returns a short human-readable note for the UPDATE_CONFIG response."""
+        # Parse the server id and peers (JSON list or single URL), then build the LDIF.
         try:
             server_id = int(data.get("LDAP_SERVER_ID"))
             peers = data.get("LDAP_MIRROR_PEERS")
@@ -547,19 +612,24 @@ class LdapSpoke(BaseSpoke):
             overlay = replication.build_syncprov_overlay_ldif()
             mirror = replication.build_full_mirror_ldif(
                 server_id, peers, base_dn, admin_dn, admin_pw)
+        # Bad input: report it without touching slapd.
         except (ValueError, TypeError, json.JSONDecodeError) as e:
             return f"replication config invalid: {str(e)[:120]}"
         # syncprov module + overlay: tolerate "exists" so re-runs are idempotent
         # (module load → "value exists", overlay add → "already exists").
+        # Load the syncprov module.
         err = await self._ldapmodify_tolerant(
             replication.build_syncprov_module_ldif(), tolerate="exists")
         if err:
             return f"replication syncprov module load failed: {err[:160]}"
+        # Add the syncprov overlay.
         err = await self._ldapmodify_tolerant(overlay, tolerate="already exists")
         if err:
             return f"replication syncprov apply failed: {err[:160]}"
+        # Apply server id, syncrepl and mirror mode.
         err = await self._ldapmodify_tolerant(mirror)
         if err:
             return f"replication mirror apply failed: {err[:160]}"
+        # All steps succeeded.
         logger.info("UPDATE_CONFIG: mirror-mode replication re-applied (serverID=%s)", server_id)
         return "mirror-mode replication re-applied"
