@@ -16,8 +16,10 @@ matching ``base_structure.ldif`` and ``LDAP_PROVISION_TENANT_OU``):
         ou=users
         ou=groups
 """
+# Allows modern type hints to be written as plain annotations.
 from __future__ import annotations
 
+# re validates slug shape; Optional is a type hint.
 import re
 from typing import Optional
 
@@ -40,20 +42,28 @@ def escape_rdn_value(value: Optional[str]) -> str:
     Mirrors ``ldap.dn.escape_dn_chars``: backslash-escapes the special set,
     a leading ``#`` or space, a trailing space, and NUL. Prevents DN injection
     (e.g. a ``uid`` of ``foo,ou=admins`` reparenting the entry)."""
+    # Treat None as empty, and note the length to detect the last character.
     s = "" if value is None else str(value)
     n = len(s)
+    # Build the escaped value one character at a time.
     out = []
     for i, ch in enumerate(s):
+        # NUL is written as the hex escape \00.
         if ch == "\x00":
             out.append("\\00")
+        # DN metacharacters get a leading backslash.
         elif ch in _RDN_SPECIALS:
             out.append("\\" + ch)
+        # A leading "#" would otherwise mean "hex-encoded value".
         elif ch == "#" and i == 0:
             out.append("\\#")
+        # Leading/trailing spaces would otherwise be trimmed by LDAP servers.
         elif ch == " " and (i == 0 or i == n - 1):
             out.append("\\ ")
+        # Ordinary characters are copied unchanged.
         else:
             out.append(ch)
+    # Join the pieces into the escaped string.
     return "".join(out)
 
 
@@ -72,11 +82,13 @@ def canonical_slug(tenant_slug: str) -> str:
     match ``[A-Za-z0-9][A-Za-z0-9._-]*``. Empty/None/malformed slugs are a
     caller error, surfaced as ValueError (the manager maps it to an ERROR
     envelope) rather than producing a surprising DN."""
+    # Trim whitespace, then reject empty or malformed slugs loudly.
     s = (tenant_slug or "").strip()
     if not s or not _SLUG_RE.match(s):
         raise ValueError(
             f"invalid tenant_slug {tenant_slug!r}: must match "
             f"[A-Za-z0-9][A-Za-z0-9._-]*")
+    # Lower-case is the canonical form, so one tenant maps to exactly one OU.
     return s.lower()
 
 
@@ -87,6 +99,7 @@ validate_slug = canonical_slug
 
 def _base(base_dn: str) -> str:
     """Validate and return non-empty base DN string."""
+    # Trim the base DN; an empty one cannot anchor any entry.
     b = (base_dn or "").strip()
     if not b:
         raise ValueError("base_dn is required")
@@ -96,33 +109,42 @@ def _base(base_dn: str) -> str:
 def tenant_ou_dn(base_dn: str, tenant_slug: str) -> str:
     """``ou=<slug>,<base>`` — the tenant's top-level OU. The slug is
     canonicalised (lower-cased) so "LRB"/"lrb"/"Lrb" all resolve to one OU."""
+    # Escape the canonical slug and append the base DN.
     return f"ou={escape_rdn_value(canonical_slug(tenant_slug))},{_base(base_dn)}"
 
 
 def users_container_dn(base_dn: str, tenant_slug: Optional[str] = None) -> str:
     """``ou=users`` container: under the tenant OU when ``tenant_slug`` is given,
     else directly under the base DN (back-compat base level)."""
+    # With a tenant, nest the container under the tenant OU.
     if tenant_slug:
         return f"ou=users,{tenant_ou_dn(base_dn, tenant_slug)}"
+    # Otherwise use the base-level container.
     return f"ou=users,{_base(base_dn)}"
 
 
 def groups_container_dn(base_dn: str, tenant_slug: Optional[str] = None) -> str:
     """``ou=groups`` container (tenant-scoped or base level, as above)."""
+    # With a tenant, nest the container under the tenant OU.
     if tenant_slug:
         return f"ou=groups,{tenant_ou_dn(base_dn, tenant_slug)}"
+    # Otherwise use the base-level container.
     return f"ou=groups,{_base(base_dn)}"
 
 
 def user_dn(base_dn: str, uid: str, tenant_slug: Optional[str] = None) -> str:
     """``uid=<uid>,ou=users,[ou=<slug>,]<base>``."""
+    # A blank uid would produce an invalid DN.
     if not (uid or "").strip():
         raise ValueError("uid is required")
+    # Escape the uid and place it under the right users container.
     return f"uid={escape_rdn_value(uid)},{users_container_dn(base_dn, tenant_slug)}"
 
 
 def group_dn(base_dn: str, cn: str, tenant_slug: Optional[str] = None) -> str:
     """``cn=<cn>,ou=groups,[ou=<slug>,]<base>``."""
+    # A blank group name would produce an invalid DN.
     if not (cn or "").strip():
         raise ValueError("group name (cn) is required")
+    # Escape the name and place it under the right groups container.
     return f"cn={escape_rdn_value(cn)},{groups_container_dn(base_dn, tenant_slug)}"
