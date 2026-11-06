@@ -49,6 +49,10 @@ def _add_entry(conn, dn: str, attrs: Dict[str, Any]) -> None:
 # userPassword is ``{SASL}<upn>`` — it carries no local secret.
 SASL_SCHEME = "{SASL}"
 
+# Seconds to wait to connect to slapd, and for any one LDAP operation.
+LDAP_CONNECT_TIMEOUT_S = 5
+LDAP_OP_TIMEOUT_S = 15
+
 
 class LdapBindError(Exception):
     """Raised by :meth:`LdapManager._bind` when the admin bind fails
@@ -86,10 +90,18 @@ class LdapManager:
         self.base_dn = base_dn
         self.server = server_url
 
+    def _open(self):
+        """New client handle with timeouts, so a slow or unreachable server fails
+        fast instead of holding one of the spoke's few command slots for minutes."""
+        conn = ldap.initialize(self.server)
+        conn.set_option(ldap.OPT_NETWORK_TIMEOUT, LDAP_CONNECT_TIMEOUT_S)
+        conn.set_option(ldap.OPT_TIMEOUT, LDAP_OP_TIMEOUT_S)
+        return conn
+
     def _get_connection(self):
         """Create and bind a new LDAP client connection using admin credentials."""
         # Open a client handle to the server and bind as admin.
-        conn = ldap.initialize(self.server)
+        conn = self._open()
         self._bind(conn)
         # The caller owns the connection from here on.
         return conn
@@ -120,7 +132,7 @@ class LdapManager:
         leak from _get_connection (bound per call, never closed), which exhausted
         slapd's conn limit on a long-running spoke."""
         # Open a client handle; bind inside the try so it is unbound even if bind fails.
-        conn = ldap.initialize(self.server)
+        conn = self._open()
         try:
             self._bind(conn)
             # Hand the bound connection to the with-block.
