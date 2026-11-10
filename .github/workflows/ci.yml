@@ -41,9 +41,9 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Stop early when an earlier job failed
-        if: contains(needs.*.result, 'failure')
+        if: needs.checks.result != 'success' && needs.checks.result != 'skipped'
         run: |
-          echo "::error::A job this one needs failed (see 'checks'). Tests not run."
+          echo "::error::The 'checks' job did not succeed (result: ${{ needs.checks.result }}). Tests not run."
           exit 1
       - uses: actions/checkout@v4
         with:
