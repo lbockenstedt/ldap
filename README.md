@@ -4,6 +4,23 @@ LDAP directory spoke for the Lab Manager (LM) hub-and-spoke fleet (`module_type 
 
 ---
 
+## Repository layout
+
+| Path | What it holds |
+| :--- | :--- |
+| `.claude/` | Fleet-owned skills, synced from lm; edit them in lm. |
+| `.github/` | CI (`workflows/ci.yml`), the thin `promote`/`backmerge` callers, promotion scripts and fleet-owned agents. |
+| `docs/` | This module's docs (copies of the canonical pages in `lm/docs`). |
+| `src/` | The spoke's Python source (entry point, engine, control plane). |
+| `tests/` | pytest suite; CI runs it in the `test` job. |
+| `.env.template` | Template for the `.env` the installer writes (the real `.env` is never committed). |
+| `AGENTS.md` | Orientation for people and AI agents; the fleet rules block is synced from lm. |
+| `base_structure.ldif` | Base directory tree loaded on first install. |
+| `install_ldap.sh` | Installer (idempotent; safe to re-run). |
+| `README.md` | This file. |
+| `requirements.txt` | Runtime Python dependencies. |
+| `VERSION` | Bot-owned version; promotion bumps it. Never edit by hand. |
+
 ## Architecture & Overview
 
 The `ldap` spoke bridges Lab Manager to OpenLDAP/389-DS directory servers over a persistent outbound WebSocket connection (port 443).
