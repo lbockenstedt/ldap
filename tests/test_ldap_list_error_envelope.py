@@ -209,3 +209,34 @@ def test_manager_bind_raises_ldap_bind_error_on_invalid_credentials():
         mgr._bind(_Conn())
     assert "LDAP_ADMIN_PW" in str(ei.value)
     assert "UPDATE_CONFIG" in str(ei.value)
+
+def test_malformed_ou_path_is_an_error_not_the_root():
+    # A dict/number path must not be read as "move to ou=users"; an explicit
+    # empty path still means the root.
+    sp = _spoke()
+    calls = []
+    sp.manager.move_user_scoped = lambda *a: calls.append(a) or {"status": "SUCCESS"}
+    res = _run(sp.handle_command("LDAP_MOVE_USER", {
+        "uid": "alice", "target_path": {"x": 1}, "tenant_slug": "lrb"}))
+    assert res["status"] == "ERROR" and "target_path" in res["message"] and calls == []
+    res = _run(sp.handle_command("LDAP_MOVE_USER", {
+        "uid": "alice", "target_path": ["Eng", 5], "tenant_slug": "lrb"}))
+    assert res["status"] == "ERROR" and calls == []
+    for blank in ("/", "   ", "Eng//Lab", ["Eng", " "]):
+        res = _run(sp.handle_command("LDAP_MOVE_USER", {
+            "uid": "alice", "target_path": blank, "tenant_slug": "lrb"}))
+        assert res["status"] == "ERROR" and calls == [], blank
+    res = _run(sp.handle_command("LDAP_MOVE_USER", {
+        "uid": "alice", "target_path": "", "tenant_slug": "lrb"}))
+    assert res["status"] == "SUCCESS" and calls == [("alice", [], "lrb")]
+
+
+def test_ldap_list_on_unprovisioned_tenant_is_not_provisioned_not_empty():
+    sp = _spoke()
+    for cmd, attr in (("LDAP_LIST_USERS", "list_users_scoped"),
+                      ("LDAP_LIST_GROUPS", "list_groups_scoped")):
+        setattr(sp.manager, attr, lambda slug: (_ for _ in ()).throw(
+            _mgr.TenantNotProvisionedError("this tenant's directory is not provisioned")))
+        res = _run(sp.handle_command(cmd, {"tenant_slug": "newco"}))
+        assert res == {"status": "ERROR", "error": "NOT_PROVISIONED",
+                       "message": "this tenant's directory is not provisioned"}, res
