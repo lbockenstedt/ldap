@@ -77,41 +77,6 @@ The WebUI shows an OU as a path such as `Engineering/Lab`.
   or an `A/B` string; `None`, `""` or `[]` mean the top level. Anything else
   (`"/"`, `"A//B"`, a number) is refused, never read as the top level.
 
-## Active Directory (read-only stub)
-
-`src/ad_directory.py` reads users from an AD domain, so the Directory view can
-later show LDAP, Entra and AD accounts together. It is read-only for now:
-`AD_DISCOVER`, `AD_TEST` and `AD_SEARCH_USERS`. The `ad` block of the spoke
-config holds `domain`, `forest`, `site`, `discover`, `use_global_catalog`,
-`use_ssl`, `dns_servers`, `servers`, `bind_user`, `bind_password`, `base_dn` and
-`timeout`. The hub push, the WebUI form and the Credential Vault wiring for
-`bind_password` are not built yet.
-
-Which server the spoke uses, in order:
-
-1. **DNS SRV discovery** (`discover`, default on). With `use_global_catalog`
-   (the default) it looks up the global catalogs, `_gc._tcp.<site>._sites.<forest>`
-   and then `_gc._tcp.<forest>`, on ports 3268/3269. Otherwise it looks up the
-   domain controllers, `_ldap._tcp.<site>._sites.dc._msdcs.<domain>` and then
-   `_ldap._tcp.dc._msdcs.<domain>`, on ports 389/636. Servers in the spoke's
-   own AD site come first; within one answer, lower priority wins, then higher
-   weight. The lookup uses a small standard-library DNS client (UDP with EDNS,
-   retried over TCP when truncated), so no DNS package is needed.
-   `dns_servers` points it at AD's DNS servers when the spoke's own resolver
-   can't see the AD zones.
-2. **Configured servers** (`servers`): the primary first, then the backup(s).
-   They are always tried after the discovered ones, so AD still works when
-   discovery fails.
-
-Each server gets a short timeout (`timeout`, default 3 s), and the first one
-that binds is used. A down server fails over to the next. A rejected password
-is not retried on other servers, because it would fail the same way and could
-lock the service account. An empty password is refused, since AD treats it as
-an anonymous bind that "succeeds". The password is never sent in clear: LDAPS
-(`use_ssl`, the default) or, with `use_ssl` off, StartTLS on 389/3268; a server
-that can't do TLS is skipped. Either way the spoke must trust the AD
-certificate authority.
-
 ## Key files
 
 `src/main.py`, `src/ldap_spoke.py`, `src/ldap_manager.py` (~300 lines, whole `LdapManager`), `install_ldap.sh`, `base_structure.ldif` (reference OU/user template, not auto-applied), `tests/test_install_cert.py` (INSTALL_CERT unit tests, stubs python-ldap), `README.md`, `.env.template`, `requirements.txt`, `VERSION`.

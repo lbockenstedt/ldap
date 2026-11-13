@@ -112,9 +112,6 @@ The following commands are handled by `LdapSpoke`:
 | `LDAP_RENAME_OU` | `path`, `new_name`, `tenant_slug` | Renames an OU; group memberships of the users inside follow the new DNs. The `ou=users` root can't be renamed. |
 | `LDAP_DELETE_OU` | `path`, `tenant_slug` | Deletes an OU only when it is empty (no users, no child OUs). The root can't be deleted. |
 | `LDAP_MOVE_USER` | `uid`, `target_path`, `tenant_slug` | Moves a user to another OU **of the same tenant** (empty path = `ou=users`) and rewrites its group memberships. Users never move between tenants. |
-| `AD_DISCOVER` | *None* (uses the `ad` config block) | Read-only AD stub: lists the servers that would be tried, in order: DNS SRV global catalogs (own site first) or DCs, then the configured primary and backup. |
-| `AD_TEST` | *None* | Binds to the first AD server that answers and reports which one; a down server fails over to the next, a wrong password does not. |
-| `AD_SEARCH_USERS` | `q`, `limit` (max 1000) | Read-only AD user search by sAMAccountName, UPN, display name or mail; `truncated` is true when more matched. |
 | `INSTALL_CERT` | `fullchain`, `privkey`, `chain` | Installs an ACME TLS certificate into `/etc/ldap/tls/`, updates `cn=config`, and restarts `slapd`. |
 
 ---
