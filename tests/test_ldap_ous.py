@@ -226,9 +226,19 @@ def test_list_ous_tree_with_counts(env):
     assert res["root_user_count"] == 1
 
 
-def test_list_ous_empty_tenant(env):
+def test_unprovisioned_tenant_is_not_reported_as_empty_or_missing_user(env):
     mgr, _ = env
-    assert mgr.list_ous_scoped("newco") == {"status": "SUCCESS", "ous": [], "root_user_count": 0}
+    # No ou=users for newco: listing OUs is an error, not an empty tree.
+    res = mgr.list_ous_scoped("newco")
+    assert res["status"] == "ERROR" and res["error"] == "NOT_PROVISIONED"
+    # User lookups say the tenant is missing, not that the user is.
+    for res in (mgr.update_user_scoped("alice", {"cn": "A"}, "newco"),
+                mgr.get_user_groups("alice", "newco"),
+                mgr.move_user_scoped("alice", [], "newco"),
+                mgr.create_user_scoped("carol", tenant_slug="newco", ou_path=["Eng"])):
+        assert res["status"] == "ERROR" and "not provisioned" in res["message"], res
+    # In a provisioned tenant, a missing OU is still "OU not found".
+    assert mgr.create_user_scoped("dave", tenant_slug="acme", ou_path=["Nope"])["message"] == "OU not found: Nope"
 
 
 def test_create_ou_nested_and_errors(env):
@@ -341,3 +351,80 @@ def test_failed_rollback_is_reported_as_partial(env, monkeypatch):
     res = mgr.move_user_scoped("alice", ["Sales"], "acme")
     assert res["status"] == "ERROR" and res["error"] == "PARTIAL_ROLLBACK"
     assert f"still at uid=alice,ou=Sales,{USERS}" in res["message"]
+
+
+def test_partial_rollback_reports_every_group_left_on_the_gone_dn(env, monkeypatch):
+    mgr, fake = env
+    alice = f"uid=alice,ou=Lab,ou=Eng,{USERS}"
+    fake.e[f"cn=ops,{GROUPS}".lower()] = (f"cn=ops,{GROUPS}", {
+        "objectClass": [b"groupOfNames"], "member": [alice.encode()]})
+    real_rename, real_modify = fake.rename_s, fake.modify_s
+    renames = {"n": 0}
+
+    def rename_once(*a):
+        # The move's rename works; the rollback's rename fails.
+        renames["n"] += 1
+        if renames["n"] > 1:
+            raise fake.ldap.LDAPError("server busy")
+        return real_rename(*a)
+
+    def modify_fails_on_ops(dn, modlist):
+        # staff is rewritten (and later put back); ops refuses the rewrite.
+        if dn.lower().startswith("cn=ops"):
+            raise fake.ldap.LDAPError("group write refused")
+        return real_modify(dn, modlist)
+    monkeypatch.setattr(fake, "rename_s", rename_once)
+    monkeypatch.setattr(fake, "modify_s", modify_fails_on_ops)
+    res = mgr.move_user_scoped("alice", ["Sales"], "acme")
+    assert res["status"] == "ERROR" and res["error"] == "PARTIAL_ROLLBACK"
+    assert f"still at uid=alice,ou=Sales,{USERS}" in res["message"]
+    # Both the group put back (staff) and the one that refused (ops) now
+    # point at alice's old, gone DN, and both are reported.
+    assert f"group cn=staff,{GROUPS} lists an old DN" in res["message"]
+    assert f"group cn=ops,{GROUPS} lists an old DN" in res["message"]
+
+
+def test_partial_rollback_omits_a_group_that_already_lists_the_new_dn(env, monkeypatch):
+    mgr, fake = env
+    alice = f"uid=alice,ou=Lab,ou=Eng,{USERS}"
+    fake.e[f"cn=ops,{GROUPS}".lower()] = (f"cn=ops,{GROUPS}", {
+        "objectClass": [b"groupOfNames"], "member": [alice.encode()]})
+    real_rename, real_modify = fake.rename_s, fake.modify_s
+    renames, staff_calls = {"n": 0}, {"n": 0}
+
+    def rename_once(*a):
+        # The move's rename works; the rollback's rename fails.
+        renames["n"] += 1
+        if renames["n"] > 1:
+            raise fake.ldap.LDAPError("server busy")
+        return real_rename(*a)
+
+    def modify(dn, modlist):
+        # staff takes the rewrite but refuses its revert; ops refuses the rewrite.
+        if dn.lower().startswith("cn=ops"):
+            raise fake.ldap.LDAPError("group write refused")
+        staff_calls["n"] += 1
+        if staff_calls["n"] > 1:
+            raise fake.ldap.LDAPError("revert refused")
+        return real_modify(dn, modlist)
+    monkeypatch.setattr(fake, "rename_s", rename_once)
+    monkeypatch.setattr(fake, "modify_s", modify)
+    res = mgr.move_user_scoped("alice", ["Sales"], "acme")
+    assert res["error"] == "PARTIAL_ROLLBACK"
+    # staff lists alice's new DN, where she really is: it is not reported.
+    assert "cn=staff" not in res["message"]
+    assert f"group cn=ops,{GROUPS} lists an old DN" in res["message"]
+
+
+def test_create_user_reports_tenant_removed_after_the_uid_check(env, monkeypatch):
+    mgr, fake = env
+    real_add = fake.add_s
+
+    def add_after_tenant_removed(dn, modlist):
+        # ou=users (and everything below it) disappears just before the add.
+        for k in [k for k in fake.e if k == USERS.lower() or k.endswith("," + USERS.lower())]:
+            del fake.e[k]
+        return real_add(dn, modlist)
+    monkeypatch.setattr(fake, "add_s", add_after_tenant_removed)
+    res = mgr.create_user_scoped("carol", tenant_slug="acme", ou_path=["Sales"])
+    assert res["status"] == "ERROR" and "not provisioned" in res["message"], res

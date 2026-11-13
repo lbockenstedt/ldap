@@ -73,6 +73,9 @@ The WebUI shows an OU as a path such as `Engineering/Lab`.
 - **A failed move is undone, or reported.** If rewriting group members fails,
   the spoke undoes the move. If the undo also fails, the reply has
   `error: PARTIAL_ROLLBACK` and a message listing what is still changed.
+- **A tenant that was never provisioned is an error.** With no `ou=users`,
+  listing OUs returns `error: NOT_PROVISIONED`, and user operations say the
+  tenant is not provisioned rather than "user not found" or "OU not found".
 - **A malformed path is an error.** A path must be a list of non-blank names
   or an `A/B` string; `None`, `""` or `[]` mean the top level. Anything else
   (`"/"`, `"A//B"`, a number) is refused, never read as the top level.

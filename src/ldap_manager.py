@@ -85,6 +85,12 @@ class PartialRollbackError(Exception):
     partly changed, and the message lists what is still changed."""
 
 
+class TenantNotProvisionedError(ValueError):
+    """The tenant's ``ou=users`` container does not exist, so the tenant's
+    directory was never provisioned. Kept apart from "user not found" and
+    "OU not found" so a missing tenant is never reported as a missing user."""
+
+
 class LdapManager:
     """Synchronous LDAP CRUD wrapper over ``python-ldap``.
 
@@ -494,7 +500,8 @@ class LdapManager:
         Users can sit in any OU below ``ou=users``, so their DN can't be built
         from the uid alone. A uid is unique within a tenant (create enforces
         it); if two entries ever share one, raise rather than act on the wrong
-        user. Returns None when no user has this uid."""
+        user. Returns None when no user has this uid; raises
+        :class:`TenantNotProvisionedError` when the container itself is missing."""
         # A blank uid can never match.
         if not (uid or "").strip():
             raise ValueError("uid is required")
@@ -505,7 +512,8 @@ class LdapManager:
             res = conn.search_s(base, ldap.SCOPE_SUBTREE,
                                 f"(&(objectClass=person)(uid={safe}))", ['uid'])
         except ldap.NO_SUCH_OBJECT:
-            return None
+            raise TenantNotProvisionedError(
+                f"this tenant's directory is not provisioned ({base} is missing)")
         dns = [dn for dn, _a in res if dn]
         if len(dns) > 1:
             raise ValueError(f"uid {uid!r} is not unique in this tenant")
@@ -538,6 +546,9 @@ class LdapManager:
             groups = conn.search_s(groups_container_dn(self.base_dn, tenant_slug),
                                    ldap.SCOPE_SUBTREE, "(objectClass=groupOfNames)",
                                    ['member'])
+        # No groups container means the tenant has no groups, so no group can
+        # list the moved users: 0 is the true count, not a failed read (any
+        # other error propagates to the caller's rollback).
         except ldap.NO_SUCH_OBJECT:
             return 0
         changed = 0
@@ -611,13 +622,18 @@ class LdapManager:
                 if self._find_user_dn(conn, uid, tenant_slug):
                     return {"status": "ERROR",
                             "message": f"user {uid!r} already exists in this tenant"}
-                _add_entry(conn, dn, entry)
+                try:
+                    _add_entry(conn, dn, entry)
+                except ldap.NO_SUCH_OBJECT:
+                    # The parent is missing. Look again: if ou=users itself is
+                    # gone (removed since the check above), this raises
+                    # TenantNotProvisionedError; otherwise the chosen OU is.
+                    self._find_user_dn(conn, uid, tenant_slug)
+                    return {"status": "ERROR", "message": "OU not found: " + "/".join(ou_path or [])}
             out = {"status": "SUCCESS", "dn": dn, "auth_mode": auth_mode}
             if result_pw is not None:
                 out["password"] = result_pw
             return out
-        except ldap.NO_SUCH_OBJECT:
-            return {"status": "ERROR", "message": "OU not found: " + "/".join(ou_path or [])}
         except ValueError as e:
             return {"status": "ERROR", "message": str(e)}
         except ldap.LDAPError as e:
@@ -896,8 +912,11 @@ class LdapManager:
                 res = conn.search_s(base, ldap.SCOPE_SUBTREE,
                                     "(|(objectClass=organizationalUnit)(objectClass=person))",
                                     ['objectClass'])
+        # No ou=users: the tenant was never provisioned, which is not the same
+        # as a provisioned tenant with no OUs.
         except ldap.NO_SUCH_OBJECT:
-            return {"status": "SUCCESS", "ous": [], "root_user_count": 0}
+            return {"status": "ERROR", "error": "NOT_PROVISIONED",
+                    "message": f"this tenant's directory is not provisioned ({base} is missing)"}
         except ldap.LDAPError as e:
             logger.error(f"Error listing OUs under {base}: {e}")
             return {"status": "ERROR", "message": str(e)}
@@ -970,13 +989,38 @@ class LdapManager:
                 conn.rename_s(new_dn, old_parts[0], ",".join(old_parts[1:]), 1)
             except ldap.LDAPError as e:
                 logger.error(f"Rollback of move {new_dn} -> {old_dn} failed: {e}")
-                stuck.append(f"entry is still at {new_dn}")
+                # The entry stayed at its new place, so the groups that are
+                # wrong now are exactly those still listing an old DN (put
+                # back, refused the rewrite or not reached). A group whose
+                # revert failed lists the new DN and is therefore correct.
+                stuck = [f"entry is still at {new_dn}"]
+                stuck.extend(self._groups_listing_old_dns(conn, tenant_slug, moved))
             # Clean undo: report the original error. Partial undo: say exactly
             # what was left changed, so it is never read as "nothing happened".
             if stuck:
                 raise PartialRollbackError(
                     f"{exc}; the change could not be fully undone: " + "; ".join(stuck)) from exc
             raise
+
+    def _groups_listing_old_dns(self, conn, tenant_slug: Optional[str],
+                                moved: Dict[str, str]) -> List[str]:
+        """Describe each group that still lists one of ``moved``'s old DNs,
+        for a partial-rollback report. If the groups can't be read, say so
+        rather than report none."""
+        old = {o.lower() for o in moved}
+        try:
+            groups = conn.search_s(groups_container_dn(self.base_dn, tenant_slug),
+                                   ldap.SCOPE_SUBTREE, "(objectClass=groupOfNames)",
+                                   ['member'])
+        except ldap.NO_SUCH_OBJECT:
+            return []
+        except ldap.LDAPError as e:
+            logger.error(f"Could not re-read groups after a failed rollback: {e}")
+            return ["groups could not be checked for the old DN"]
+        return [f"group {gdn} lists an old DN, which no longer exists"
+                for gdn, attrs in groups
+                if gdn and any(v.decode('utf-8', 'replace').lower() in old
+                               for v in attrs.get('member', []))]
 
     def _users_below(self, conn, dn: str) -> List[str]:
         """DNs of every user at or below ``dn`` (empty when the entry is gone)."""
