@@ -229,3 +229,14 @@ def test_malformed_ou_path_is_an_error_not_the_root():
     res = _run(sp.handle_command("LDAP_MOVE_USER", {
         "uid": "alice", "target_path": "", "tenant_slug": "lrb"}))
     assert res["status"] == "SUCCESS" and calls == [("alice", [], "lrb")]
+
+
+def test_ldap_list_on_unprovisioned_tenant_is_not_provisioned_not_empty():
+    sp = _spoke()
+    for cmd, attr in (("LDAP_LIST_USERS", "list_users_scoped"),
+                      ("LDAP_LIST_GROUPS", "list_groups_scoped")):
+        setattr(sp.manager, attr, lambda slug: (_ for _ in ()).throw(
+            _mgr.TenantNotProvisionedError("this tenant's directory is not provisioned")))
+        res = _run(sp.handle_command(cmd, {"tenant_slug": "newco"}))
+        assert res == {"status": "ERROR", "error": "NOT_PROVISIONED",
+                       "message": "this tenant's directory is not provisioned"}, res

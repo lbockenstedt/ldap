@@ -107,7 +107,7 @@ The following commands are handled by `LdapSpoke`:
 | `LDAP_CREATE_USER` | `uid`, `attrs`, `tenant_slug`, `auth_mode` (`local`/`entra`), `upn`, `password`, `ou_path` | Creates a tenant user, optionally inside an existing OU (`ou_path`, e.g. `["Engineering","Lab"]`). The uid must be unique across the whole tenant. |
 | `LDAP_UPDATE_USER` / `LDAP_DELETE_USER` / `LDAP_SET_PASSWORD` / `LDAP_ADD_MEMBER` / `LDAP_REMOVE_MEMBER` / `LDAP_GET_USER_GROUPS` | `uid`, `tenant_slug`, … | Find the user by uid anywhere under the tenant's `ou=users`, so users in OUs work. A missing user is an ERROR. |
 | `LDAP_LIST_USERS` | `tenant_slug` | Tenant users. Each has `ou_path` (the OUs it sits in) and `upn` (the Entra UPN of Entra-backed users, else empty). |
-| `LDAP_LIST_OUS` | `tenant_slug` | OUs below the tenant's `ou=users`: `{ous: [{path, name, user_count}], root_user_count}`. A tenant with no `ou=users` gets `ERROR` with `error: NOT_PROVISIONED`, not an empty list. |
+| `LDAP_LIST_OUS` | `tenant_slug` | OUs below the tenant's `ou=users`: `{ous: [{path, name, user_count}], root_user_count}`. A tenant with no `ou=users` gets `ERROR` with `error: NOT_PROVISIONED`, not an empty list; `LDAP_LIST_USERS`, `LDAP_LIST_GROUPS` and the other OU and user commands return the same code. |
 | `LDAP_CREATE_OU` | `name`, `parent_path`, `tenant_slug` | Creates an OU (1-64 characters, no `/`) under an existing parent (empty = `ou=users`). |
 | `LDAP_RENAME_OU` | `path`, `new_name`, `tenant_slug` | Renames an OU; group memberships of the users inside follow the new DNs. The `ou=users` root can't be renamed. |
 | `LDAP_DELETE_OU` | `path`, `tenant_slug` | Deletes an OU only when it is empty (no users, no child OUs). The root can't be deleted. |

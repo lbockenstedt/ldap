@@ -231,12 +231,21 @@ def test_unprovisioned_tenant_is_not_reported_as_empty_or_missing_user(env):
     # No ou=users for newco: listing OUs is an error, not an empty tree.
     res = mgr.list_ous_scoped("newco")
     assert res["status"] == "ERROR" and res["error"] == "NOT_PROVISIONED"
+    # Listing users or groups raises it too (the spoke replies NOT_PROVISIONED).
+    for listing in (mgr.list_users_scoped, mgr.list_groups_scoped):
+        with pytest.raises(ValueError, match="not provisioned"):
+            listing("newco")
     # User lookups say the tenant is missing, not that the user is.
     for res in (mgr.update_user_scoped("alice", {"cn": "A"}, "newco"),
+                mgr.delete_user_scoped("alice", "newco"),
+                mgr.set_password_scoped("alice", "pw", "newco"),
+                mgr.add_member_scoped("alice", "staff", "newco"),
+                mgr.remove_member_scoped("alice", "staff", "newco"),
                 mgr.get_user_groups("alice", "newco"),
                 mgr.move_user_scoped("alice", [], "newco"),
                 mgr.create_user_scoped("carol", tenant_slug="newco", ou_path=["Eng"])):
-        assert res["status"] == "ERROR" and "not provisioned" in res["message"], res
+        assert res["status"] == "ERROR" and res.get("error") == "NOT_PROVISIONED", res
+        assert "not provisioned" in res["message"], res
     # In a provisioned tenant, a missing OU is still "OU not found".
     assert mgr.create_user_scoped("dave", tenant_slug="acme", ou_path=["Nope"])["message"] == "OU not found: Nope"
 
@@ -427,4 +436,81 @@ def test_create_user_reports_tenant_removed_after_the_uid_check(env, monkeypatch
         return real_add(dn, modlist)
     monkeypatch.setattr(fake, "add_s", add_after_tenant_removed)
     res = mgr.create_user_scoped("carol", tenant_slug="acme", ou_path=["Sales"])
-    assert res["status"] == "ERROR" and "not provisioned" in res["message"], res
+    assert res["status"] == "ERROR" and res.get("error") == "NOT_PROVISIONED", res
+
+
+def test_ou_commands_report_an_unprovisioned_tenant_not_a_missing_ou(env):
+    mgr, _ = env
+    # newco has no ou=users: every OU write says so instead of "OU not found".
+    for res in (mgr.create_ou_scoped("Ops", [], "newco"),
+                mgr.create_ou_scoped("Ops", ["Eng"], "newco"),
+                mgr.rename_ou_scoped(["Eng"], "Ops", "newco"),
+                mgr.delete_ou_scoped(["Eng"], "newco"),
+                mgr.create_user_scoped("carol", tenant_slug="newco", ou_path=["Eng"])):
+        assert res["status"] == "ERROR" and res.get("error") == "NOT_PROVISIONED", res
+    # In a provisioned tenant a missing OU is still just that.
+    for res, msg in ((mgr.create_ou_scoped("X", ["Nope"], "acme"), "parent OU not found: Nope"),
+                     (mgr.rename_ou_scoped(["Nope"], "X", "acme"), "OU not found: Nope"),
+                     (mgr.delete_ou_scoped(["Nope"], "acme"), "OU not found: Nope"),
+                     (mgr.move_user_scoped("alice", ["Nope"], "acme"), "OU not found: Nope")):
+        assert res == {"status": "ERROR", "message": msg}, res
+
+
+def test_delete_user_reports_a_directory_error_during_the_lookup(env, monkeypatch):
+    mgr, fake = env
+
+    def down(*_a, **_k):
+        raise fake.ldap.LDAPError("server down")
+    monkeypatch.setattr(fake, "search_s", down)
+    assert mgr.delete_user_scoped("alice", "acme") == {"status": "ERROR", "message": "server down"}
+
+
+def test_group_gone_during_the_move_is_not_reported_as_a_missing_ou(env, monkeypatch):
+    mgr, fake = env
+    real_modify = fake.modify_s
+    calls = {"n": 0}
+
+    def modify(dn, modlist):
+        # The first group rewrite finds the group deleted meanwhile.
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise fake.ldap.NO_SUCH_OBJECT(dn)
+        return real_modify(dn, modlist)
+    monkeypatch.setattr(fake, "modify_s", modify)
+    res = mgr.move_user_scoped("alice", ["Sales"], "acme")
+    assert res["status"] == "ERROR" and "a group changed during the move" in res["message"], res
+    assert "OU not found" not in res["message"]
+    # The move was undone.
+    assert f"uid=alice,ou=lab,ou=eng,{USERS}".lower() in fake.e
+
+
+def test_list_groups_without_users_container_is_not_provisioned(env):
+    mgr, fake = env
+    # ou=users (and the users in it) is gone but ou=groups is still there.
+    for k in [k for k in fake.e if k == USERS.lower() or k.endswith("," + USERS.lower())]:
+        del fake.e[k]
+    with pytest.raises(ValueError, match="not provisioned"):
+        mgr.list_groups_scoped("acme")
+
+
+def test_list_groups_with_groups_container_gone_is_a_directory_error(env):
+    mgr, fake = env
+    # ou=users is there (the tenant is provisioned) but ou=groups is gone.
+    for k in [k for k in fake.e if k == GROUPS.lower() or k.endswith("," + GROUPS.lower())]:
+        del fake.e[k]
+    with pytest.raises(fake.ldap.LDAPError, match="groups container missing") as exc:
+        mgr.list_groups_scoped("acme")
+    assert not isinstance(exc.value, ValueError)
+
+
+def test_user_removed_during_the_move_is_not_reported_as_a_missing_ou(env, monkeypatch):
+    mgr, fake = env
+    real_rename = fake.rename_s
+
+    def rename(dn, newrdn, newsuperior=None, delold=1):
+        # Someone deletes the user between the lookup and the rename.
+        fake.e.pop(dn.lower(), None)
+        return real_rename(dn, newrdn, newsuperior, delold)
+    monkeypatch.setattr(fake, "rename_s", rename)
+    assert mgr.move_user_scoped("alice", ["Sales"], "acme") == {
+        "status": "ERROR", "message": "user not found: alice"}

@@ -91,6 +91,20 @@ class TenantNotProvisionedError(ValueError):
     "OU not found" so a missing tenant is never reported as a missing user."""
 
 
+def _not_provisioned_message(users_dn: str) -> str:
+    """The one wording for a tenant whose ``ou=users`` is missing."""
+    return f"this tenant's directory is not provisioned ({users_dn} is missing)"
+
+
+def _error_reply(e: Exception) -> Dict[str, Any]:
+    """ERROR envelope for a failed user command. A missing tenant also gets
+    ``error: NOT_PROVISIONED``, the same code the OU commands return."""
+    out = {"status": "ERROR", "message": str(e)}
+    if isinstance(e, TenantNotProvisionedError):
+        out["error"] = "NOT_PROVISIONED"
+    return out
+
+
 class LdapManager:
     """Synchronous LDAP CRUD wrapper over ``python-ldap``.
 
@@ -512,8 +526,7 @@ class LdapManager:
             res = conn.search_s(base, ldap.SCOPE_SUBTREE,
                                 f"(&(objectClass=person)(uid={safe}))", ['uid'])
         except ldap.NO_SUCH_OBJECT:
-            raise TenantNotProvisionedError(
-                f"this tenant's directory is not provisioned ({base} is missing)")
+            raise TenantNotProvisionedError(_not_provisioned_message(base))
         dns = [dn for dn, _a in res if dn]
         if len(dns) > 1:
             raise ValueError(f"uid {uid!r} is not unique in this tenant")
@@ -525,6 +538,22 @@ class LdapManager:
         if not dn:
             raise ValueError(f"user not found: {uid}")
         return dn
+
+    def _missing_ou_error(self, conn, tenant_slug: Optional[str], message: str) -> Dict[str, Any]:
+        """Error reply for an OU command that hit NO_SUCH_OBJECT.
+
+        That error can mean the tenant's ``ou=users`` is gone (never
+        provisioned, or removed meanwhile) or only the named OU is missing.
+        Probe the container on the same connection so the two are reported
+        differently: NOT_PROVISIONED (as ``list_ous_scoped`` does) or
+        ``message``. A failed probe raises LDAPError to the caller."""
+        base = users_container_dn(self.base_dn, tenant_slug)
+        try:
+            conn.search_s(base, ldap.SCOPE_BASE, "(objectClass=*)", ['ou'])
+        except ldap.NO_SUCH_OBJECT:
+            return {"status": "ERROR", "error": "NOT_PROVISIONED",
+                    "message": _not_provisioned_message(base)}
+        return {"status": "ERROR", "message": message}
 
     def _rewrite_memberships(self, conn, tenant_slug: Optional[str],
                              moved: Dict[str, str], done: Optional[list] = None) -> int:
@@ -625,17 +654,16 @@ class LdapManager:
                 try:
                     _add_entry(conn, dn, entry)
                 except ldap.NO_SUCH_OBJECT:
-                    # The parent is missing. Look again: if ou=users itself is
-                    # gone (removed since the check above), this raises
-                    # TenantNotProvisionedError; otherwise the chosen OU is.
-                    self._find_user_dn(conn, uid, tenant_slug)
-                    return {"status": "ERROR", "message": "OU not found: " + "/".join(ou_path or [])}
+                    # The parent is missing: either ou=users itself (removed
+                    # since the check above) or the chosen OU.
+                    return self._missing_ou_error(conn, tenant_slug,
+                                                  "OU not found: " + "/".join(ou_path or []))
             out = {"status": "SUCCESS", "dn": dn, "auth_mode": auth_mode}
             if result_pw is not None:
                 out["password"] = result_pw
             return out
         except ValueError as e:
-            return {"status": "ERROR", "message": str(e)}
+            return _error_reply(e)
         except ldap.LDAPError as e:
             # LDAP error: log and report it.
             logger.error(f"Error creating user {dn}: {e}")
@@ -662,7 +690,7 @@ class LdapManager:
                 conn.modify_s(dn, mods)
             return {"status": "SUCCESS", "dn": dn}
         except ValueError as e:
-            return {"status": "ERROR", "message": str(e)}
+            return _error_reply(e)
         except ldap.LDAPError as e:
             # LDAP error: log and report it.
             logger.error(f"Error updating user {uid}: {e}")
@@ -675,6 +703,11 @@ class LdapManager:
             with self._conn() as conn:
                 dn = self._require_user_dn(conn, uid, tenant_slug)
         except ValueError as e:
+            return _error_reply(e)
+        except ldap.LDAPError as e:
+            # Directory unreachable during the lookup: report it like the
+            # other user commands do.
+            logger.error(f"Error looking up user {uid} to delete: {e}")
             return {"status": "ERROR", "message": str(e)}
         return self.delete_entity(dn)
 
@@ -702,7 +735,7 @@ class LdapManager:
                 conn.modify_s(dn, [(ldap.MOD_REPLACE, 'userPassword', [self._ssha(new_password)])])
             return {"status": "SUCCESS", "dn": dn}
         except ValueError as e:
-            return {"status": "ERROR", "message": str(e)}
+            return _error_reply(e)
         except ldap.LDAPError as e:
             # LDAP error: log and report it.
             logger.error(f"Error setting password for {dn}: {e}")
@@ -746,7 +779,7 @@ class LdapManager:
         try:
             u_dn, g_dn = self._member_dns(uid, group_cn, tenant_slug)
         except (ValueError, ldap.LDAPError) as e:
-            return {"status": "ERROR", "message": str(e)}
+            return _error_reply(e)
         return self.add_user_to_group(u_dn, g_dn)
 
     def _member_dns(self, uid: str, group_cn: str, tenant_slug: Optional[str]):
@@ -764,11 +797,12 @@ class LdapManager:
         try:
             u_dn, g_dn = self._member_dns(uid, group_cn, tenant_slug)
         except (ValueError, ldap.LDAPError) as e:
-            return {"status": "ERROR", "message": str(e)}
+            return _error_reply(e)
         return self.remove_user_from_group(u_dn, g_dn)
 
     def list_users_scoped(self, tenant_slug: Optional[str] = None) -> List[Dict[str, Any]]:
-        """List users under a tenant's ``ou=users`` (or base level if no slug)."""
+        """List users under a tenant's ``ou=users`` (or base level if no slug).
+        Raises :class:`TenantNotProvisionedError` when the container is missing."""
         # Resolve the tenant's users container; an invalid tenant yields an empty list.
         try:
             search_base = users_container_dn(self.base_dn, tenant_slug)
@@ -780,9 +814,10 @@ class LdapManager:
                 results = conn.search_s(search_base, ldap.SCOPE_SUBTREE,
                                         "(objectClass=person)",
                                         ['uid', 'cn', 'sn', 'givenName', 'mail', 'userPassword'])
-        # Container missing: no users.
+        # Container missing: the tenant was never provisioned, which is not
+        # the same as a provisioned tenant with no users.
         except ldap.NO_SUCH_OBJECT:
-            return []
+            raise TenantNotProvisionedError(_not_provisioned_message(search_base))
         # Convert each result into a user dictionary.
         users = []
         for dn, attrs in results:
@@ -811,21 +846,32 @@ class LdapManager:
         return users
 
     def list_groups_scoped(self, tenant_slug: Optional[str] = None) -> List[Dict[str, Any]]:
-        """List groups under a tenant's ``ou=groups`` (or base level if no slug)."""
-        # Resolve the tenant's groups container; an invalid tenant yields an empty list.
+        """List groups under a tenant's ``ou=groups`` (or base level if no slug).
+        Raises :class:`TenantNotProvisionedError` when ``ou=users`` is
+        missing, and ``ldap.LDAPError`` when only ``ou=groups`` is."""
+        # Resolve the tenant's containers; an invalid tenant yields an empty list.
         try:
+            users_base = users_container_dn(self.base_dn, tenant_slug)
             search_base = groups_container_dn(self.base_dn, tenant_slug)
         except ValueError:
             return []
-        # Search the container for both group types.
-        try:
-            with self._conn() as conn:
+        # ou=users is what marks a tenant as provisioned (as for every other
+        # command), so check it too: groups left behind without it are not a
+        # provisioned tenant.
+        with self._conn() as conn:
+            try:
+                conn.search_s(users_base, ldap.SCOPE_BASE, "(objectClass=*)", ['ou'])
+            except ldap.NO_SUCH_OBJECT:
+                raise TenantNotProvisionedError(_not_provisioned_message(users_base))
+            # Search the groups container for both group types. A provisioned
+            # tenant whose ou=groups is gone is a damaged directory: report it
+            # as an error, neither "not provisioned" nor "no groups".
+            try:
                 results = conn.search_s(search_base, ldap.SCOPE_SUBTREE,
                                         "(|(objectClass=groupOfNames)(objectClass=posixGroup))",
                                         ['cn', 'member', 'memberUid'])
-        # Container missing: no groups.
-        except ldap.NO_SUCH_OBJECT:
-            return []
+            except ldap.NO_SUCH_OBJECT:
+                raise ldap.LDAPError(f"groups container missing: {search_base}")
         # Convert each result into a group dictionary.
         groups = []
         for dn, attrs in results:
@@ -861,7 +907,7 @@ class LdapManager:
                 try:
                     u_dn = self._find_user_dn(conn, uid, tenant_slug)
                 except ValueError as e:
-                    return {"status": "ERROR", "message": str(e)}
+                    return _error_reply(e)
                 if not u_dn:
                     return {"status": "ERROR", "message": f"user not found: {uid}"}
                 # memberOf on the user entry (present only with the memberof overlay).
@@ -916,7 +962,7 @@ class LdapManager:
         # as a provisioned tenant with no OUs.
         except ldap.NO_SUCH_OBJECT:
             return {"status": "ERROR", "error": "NOT_PROVISIONED",
-                    "message": f"this tenant's directory is not provisioned ({base} is missing)"}
+                    "message": _not_provisioned_message(base)}
         except ldap.LDAPError as e:
             logger.error(f"Error listing OUs under {base}: {e}")
             return {"status": "ERROR", "message": str(e)}
@@ -948,16 +994,18 @@ class LdapManager:
             dn = ou_path_dn(self.base_dn, tenant_slug, list(parent_path or []) + [clean])
         except ValueError as e:
             return {"status": "ERROR", "message": str(e)}
-        # Create it; a missing parent or an existing OU is a clear error.
+        # Create it; a missing tenant, a missing parent or an existing OU is a clear error.
         try:
             with self._conn() as conn:
-                _add_entry(conn, dn, {'objectClass': [b'organizationalUnit'],
-                                      'ou': [clean.encode('utf-8')]})
+                try:
+                    _add_entry(conn, dn, {'objectClass': [b'organizationalUnit'],
+                                          'ou': [clean.encode('utf-8')]})
+                except ldap.NO_SUCH_OBJECT:
+                    return self._missing_ou_error(
+                        conn, tenant_slug, "parent OU not found: " + "/".join(parent_path or []))
             return {"status": "SUCCESS", "dn": dn, "path": list(parent_path or []) + [clean]}
         except ldap.ALREADY_EXISTS:
             return {"status": "ERROR", "message": f"OU already exists: {clean}"}
-        except ldap.NO_SUCH_OBJECT:
-            return {"status": "ERROR", "message": "parent OU not found: " + "/".join(parent_path or [])}
         except ldap.LDAPError as e:
             logger.error(f"Error creating OU {dn}: {e}")
             return {"status": "ERROR", "message": str(e)}
@@ -1000,6 +1048,10 @@ class LdapManager:
             if stuck:
                 raise PartialRollbackError(
                     f"{exc}; the change could not be fully undone: " + "; ".join(stuck)) from exc
+            # A group that vanished mid-rewrite raises NO_SUCH_OBJECT; callers
+            # read that as "OU not found", so report it as a group error.
+            if isinstance(exc, ldap.NO_SUCH_OBJECT):
+                raise ldap.LDAPError(f"a group changed during the move: {exc}") from exc
             raise
 
     def _groups_listing_old_dns(self, conn, tenant_slug: Optional[str],
@@ -1034,7 +1086,9 @@ class LdapManager:
                          tenant_slug: Optional[str] = None) -> Dict[str, Any]:
         """Rename the OU at ``path``. Users inside keep their place; their
         group memberships are rewritten to the new DNs."""
-        # The users container itself can't be renamed.
+        # The users container itself can't be renamed. This is invalid input
+        # for every tenant, so it is refused before the directory is asked
+        # whether the tenant is provisioned (as a malformed name is).
         if not path:
             return {"status": "ERROR", "message": "the root users OU cannot be renamed"}
         # Build the old and new DNs; reject bad names.
@@ -1048,13 +1102,14 @@ class LdapManager:
         # Note the users below, rename, then repoint their group memberships.
         try:
             with self._conn() as conn:
-                before = self._users_below(conn, old_dn)
-                moved = {d: rebase_dn(d, old_dn, new_dn) for d in before}
-                groups = self._move_entry(conn, old_dn, new_dn, moved, tenant_slug)
+                try:
+                    before = self._users_below(conn, old_dn)
+                    moved = {d: rebase_dn(d, old_dn, new_dn) for d in before}
+                    groups = self._move_entry(conn, old_dn, new_dn, moved, tenant_slug)
+                except ldap.NO_SUCH_OBJECT:
+                    return self._missing_ou_error(conn, tenant_slug, "OU not found: " + "/".join(path))
             return {"status": "SUCCESS", "dn": new_dn, "path": new_path,
                     "users_moved": len(moved), "groups_updated": groups}
-        except ldap.NO_SUCH_OBJECT:
-            return {"status": "ERROR", "message": "OU not found: " + "/".join(path)}
         except ldap.ALREADY_EXISTS:
             return {"status": "ERROR", "message": f"OU already exists: {clean}"}
         except PartialRollbackError as e:
@@ -1066,7 +1121,9 @@ class LdapManager:
     def delete_ou_scoped(self, path: list, tenant_slug: Optional[str] = None) -> Dict[str, Any]:
         """Delete the OU at ``path`` only when it is empty (no users and no
         child OUs), so deleting a folder can never delete accounts."""
-        # The users container itself can't be deleted.
+        # The users container itself can't be deleted. This is invalid input
+        # for every tenant, so it is refused before the directory is asked
+        # whether the tenant is provisioned (as a malformed name is).
         if not path:
             return {"status": "ERROR", "message": "the root users OU cannot be deleted"}
         try:
@@ -1076,14 +1133,15 @@ class LdapManager:
         # Refuse when anything sits below the OU, then delete it.
         try:
             with self._conn() as conn:
-                children = conn.search_s(dn, ldap.SCOPE_ONELEVEL, "(objectClass=*)", ['objectClass'])
-                if [d for d, _a in children if d]:
-                    return {"status": "ERROR",
-                            "message": "OU is not empty: move or delete its users and OUs first"}
-                conn.delete_s(dn)
+                try:
+                    children = conn.search_s(dn, ldap.SCOPE_ONELEVEL, "(objectClass=*)", ['objectClass'])
+                    if [d for d, _a in children if d]:
+                        return {"status": "ERROR",
+                                "message": "OU is not empty: move or delete its users and OUs first"}
+                    conn.delete_s(dn)
+                except ldap.NO_SUCH_OBJECT:
+                    return self._missing_ou_error(conn, tenant_slug, "OU not found: " + "/".join(path))
             return {"status": "SUCCESS", "dn": dn}
-        except ldap.NO_SUCH_OBJECT:
-            return {"status": "ERROR", "message": "OU not found: " + "/".join(path)}
         except ldap.LDAPError as e:
             logger.error(f"Error deleting OU {dn}: {e}")
             return {"status": "ERROR", "message": str(e)}
@@ -1109,15 +1167,23 @@ class LdapManager:
                 if old_dn.lower() == new_dn.lower():
                     return {"status": "SUCCESS", "dn": old_dn, "message": "already in that OU"}
                 # Move, then repoint its group memberships (undone on failure).
-                groups = self._move_entry(conn, old_dn, new_dn, {old_dn: new_dn}, tenant_slug)
+                try:
+                    groups = self._move_entry(conn, old_dn, new_dn, {old_dn: new_dn}, tenant_slug)
+                except ldap.NO_SUCH_OBJECT:
+                    # The rename's source or target is gone. The target OU
+                    # still being there means the user was removed meanwhile.
+                    try:
+                        conn.search_s(target_dn, ldap.SCOPE_BASE, "(objectClass=*)", ['ou'])
+                        return {"status": "ERROR", "message": f"user not found: {uid}"}
+                    except ldap.NO_SUCH_OBJECT:
+                        return self._missing_ou_error(
+                            conn, tenant_slug, "OU not found: " + "/".join(target_path or []))
             return {"status": "SUCCESS", "dn": new_dn, "ou_path": list(target_path or []),
                     "groups_updated": groups}
         except ValueError as e:
-            return {"status": "ERROR", "message": str(e)}
+            return _error_reply(e)
         except PartialRollbackError as e:
             return {"status": "ERROR", "error": "PARTIAL_ROLLBACK", "message": str(e)}
-        except ldap.NO_SUCH_OBJECT:
-            return {"status": "ERROR", "message": "OU not found: " + "/".join(target_path or [])}
         except ldap.LDAPError as e:
             logger.error(f"Error moving user {uid}: {e}")
             return {"status": "ERROR", "message": str(e)}

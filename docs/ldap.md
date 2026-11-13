@@ -74,8 +74,14 @@ The WebUI shows an OU as a path such as `Engineering/Lab`.
   the spoke undoes the move. If the undo also fails, the reply has
   `error: PARTIAL_ROLLBACK` and a message listing what is still changed.
 - **A tenant that was never provisioned is an error.** With no `ou=users`,
-  listing OUs returns `error: NOT_PROVISIONED`, and user operations say the
-  tenant is not provisioned rather than "user not found" or "OU not found".
+  every OU and user command (list, create, rename, delete, move, password,
+  group membership) returns `ERROR` with `error: NOT_PROVISIONED`, never an
+  empty list, "user not found" or "OU not found". A provisioned tenant whose
+  `ou=groups` is gone gets a plain `ERROR` from `LDAP_LIST_GROUPS`
+  ("groups container missing"), and a user deleted while it is being moved
+  gets "user not found", not "OU not found". Invalid input (a malformed name
+  or path, or renaming or deleting the root `ou=users`) is refused before the
+  directory is asked, so it gets its own message in every tenant.
 - **A malformed path is an error.** A path must be a list of non-blank names
   or an `A/B` string; `None`, `""` or `[]` mean the top level. Anything else
   (`"/"`, `"A//B"`, a number) is refused, never read as the top level.

@@ -23,7 +23,7 @@ except ImportError:
     from core.src.base_spoke import BaseSpoke
 
 # Directory operations and the bind-failure exception.
-from .ldap_manager import LdapManager, LdapBindError
+from .ldap_manager import LdapManager, LdapBindError, TenantNotProvisionedError
 # Replication LDIF builders, imported package-relative or plain.
 try:
     from . import replication
@@ -123,6 +123,9 @@ class LdapSpoke(BaseSpoke):
         # Run the blocking read in a thread and wrap its result as data.
         try:
             return {"status": "SUCCESS", "data": await asyncio.to_thread(fn, *args)}
+        # The tenant's container is missing: say so, never an empty list.
+        except TenantNotProvisionedError as exc:
+            return {"status": "ERROR", "error": "NOT_PROVISIONED", "message": str(exc)}
         # LDAP or bind failure: return a clean ERROR envelope instead of raising.
         except (ldap.LDAPError, LdapBindError) as exc:
             return self._ldap_error_envelope(exc)
