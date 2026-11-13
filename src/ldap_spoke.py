@@ -23,7 +23,7 @@ except ImportError:
     from core.src.base_spoke import BaseSpoke
 
 # Directory operations and the bind-failure exception.
-from .ldap_manager import LdapManager, LdapBindError
+from .ldap_manager import LdapManager, LdapBindError, TenantNotProvisionedError
 # Replication LDIF builders, imported package-relative or plain.
 try:
     from . import replication
@@ -32,6 +32,33 @@ except ImportError:  # loaded outside the src package
 
 # One named logger for the spoke.
 logger = logging.getLogger("LdapSpoke")
+
+
+def _ou_path(value):
+    """Normalise an OU path from a command payload to a list of names.
+
+    Accepts a list of names (``["Engineering", "Lab"]``) or a ``/``-separated
+    string (``"Engineering/Lab"``); None, ``""`` or ``[]`` means the
+    ``ou=users`` container. Anything else (a blank segment, a non-string)
+    returns None, so a malformed path is an error and is never mistaken for
+    "the root"."""
+    # Absent or empty: the root users container.
+    if value is None or value == "":
+        return []
+    # A string is split on "/"; a list is taken as is.
+    if isinstance(value, str):
+        value = value.split("/")
+    # Every segment must be a non-blank name: "/", " " or "A//B" is malformed,
+    # not the root or a guess at what was meant.
+    if isinstance(value, (list, tuple)) and all(isinstance(p, str) and p.strip() for p in value):
+        return list(value)
+    return None
+
+
+# Commands that take an OU path, and the payload key that holds it.
+_OU_PATH_KEYS = {"LDAP_CREATE_USER": "ou_path", "LDAP_CREATE_OU": "parent_path",
+                 "LDAP_RENAME_OU": "path", "LDAP_DELETE_OU": "path",
+                 "LDAP_MOVE_USER": "target_path"}
 
 
 class _CertInstallError(Exception):
@@ -96,6 +123,9 @@ class LdapSpoke(BaseSpoke):
         # Run the blocking read in a thread and wrap its result as data.
         try:
             return {"status": "SUCCESS", "data": await asyncio.to_thread(fn, *args)}
+        # The tenant's container is missing: say so, never an empty list.
+        except TenantNotProvisionedError as exc:
+            return {"status": "ERROR", "error": "NOT_PROVISIONED", "message": str(exc)}
         # LDAP or bind failure: return a clean ERROR envelope instead of raising.
         except (ldap.LDAPError, LdapBindError) as exc:
             return self._ldap_error_envelope(exc)
@@ -256,11 +286,17 @@ class LdapSpoke(BaseSpoke):
             return await self._ldap_write(
                 self.manager.provision_tenant_ou, data.get("tenant_slug"))
 
+        # A malformed OU path is an error, never a silent "move to the root".
+        if normalized_cmd in _OU_PATH_KEYS and _ou_path(data.get(_OU_PATH_KEYS[normalized_cmd])) is None:
+            return {"status": "ERROR",
+                    "message": f"{_OU_PATH_KEYS[normalized_cmd]} must be a list of OU names or an 'A/B' string"}
+
         if normalized_cmd == "LDAP_CREATE_USER":
             return await self._ldap_write(
                 self.manager.create_user_scoped,
                 data.get("uid"), data.get("attrs") or {}, data.get("tenant_slug"),
-                data.get("auth_mode", "local"), data.get("upn"), data.get("password"))
+                data.get("auth_mode", "local"), data.get("upn"), data.get("password"),
+                _ou_path(data.get("ou_path")))
 
         if normalized_cmd == "LDAP_UPDATE_USER":
             return await self._ldap_write(
@@ -311,6 +347,31 @@ class LdapSpoke(BaseSpoke):
             return await self._ldap_write(
                 self.manager.get_user_groups,
                 data.get("uid"), data.get("tenant_slug"))
+
+        # OUs (folders) inside the tenant's ou=users. Paths are lists of OU
+        # names, top down; every path stays inside the given tenant.
+        if normalized_cmd == "LDAP_LIST_OUS":
+            return await self._ldap_write(self.manager.list_ous_scoped, data.get("tenant_slug"))
+
+        if normalized_cmd == "LDAP_CREATE_OU":
+            return await self._ldap_write(
+                self.manager.create_ou_scoped, data.get("name"),
+                _ou_path(data.get("parent_path")), data.get("tenant_slug"))
+
+        if normalized_cmd == "LDAP_RENAME_OU":
+            return await self._ldap_write(
+                self.manager.rename_ou_scoped, _ou_path(data.get("path")),
+                data.get("new_name"), data.get("tenant_slug"))
+
+        if normalized_cmd == "LDAP_DELETE_OU":
+            return await self._ldap_write(
+                self.manager.delete_ou_scoped, _ou_path(data.get("path")),
+                data.get("tenant_slug"))
+
+        if normalized_cmd == "LDAP_MOVE_USER":
+            return await self._ldap_write(
+                self.manager.move_user_scoped, data.get("uid"),
+                _ou_path(data.get("target_path")), data.get("tenant_slug"))
 
         if normalized_cmd == "INSTALL_CERT":
             # Hub-brokered Let's Encrypt cert install. The le spoke issued/

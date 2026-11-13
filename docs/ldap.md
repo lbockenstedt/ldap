@@ -46,6 +46,46 @@ Talks to the LDAP server via `python-ldap` (`ldap.initialize` + `simple_bind_s`)
 
 **Tenant-scoped (`LDAP_*` contract; TENANT == OU, 1:1, case-insensitive):** `LDAP_PROVISION_TENANT_OU {tenant_slug}` (idempotent, case-insensitive — reuses an existing OU in any case; creates `ou=<slug>,<base>` + child `ou=users`/`ou=groups`; returns OU DN), `LDAP_CREATE_USER {tenant_slug, uid, attrs, auth_mode:"entra"|"local", upn?, password?}` (entra → `userPassword {SASL}<upn>`; local → `{SSHA}`), `LDAP_UPDATE_USER`, `LDAP_DELETE_USER`, `LDAP_SET_PASSWORD` (local only — refuses `{SASL}` Entra users), `LDAP_CREATE_GROUP`, `LDAP_ADD_MEMBER`, `LDAP_REMOVE_MEMBER`, `LDAP_LIST_USERS {tenant_slug}`, `LDAP_LIST_GROUPS {tenant_slug}`, `LDAP_GET_USER_GROUPS {uid, tenant_slug}` (memberOf ∪ reverse member search — for hub RBAC). Absent `tenant_slug` = base level (back-compat). Slugs are canonical-lower-cased (`ldap_dn.canonical_slug`) so "LRB" == "lrb" resolve to one OU. DN construction/escaping via the pure `src/ldap_dn.py`.
 
+## OUs inside a tenant
+
+Tenant admins organise users into OUs (folders) below the tenant's
+`ou=users` container, for example `ou=Lab,ou=Engineering,ou=users,ou=<tenant>,<base>`.
+The WebUI shows an OU as a path such as `Engineering/Lab`.
+
+- **Commands:** `LDAP_LIST_OUS`, `LDAP_CREATE_OU`, `LDAP_RENAME_OU`,
+  `LDAP_DELETE_OU` and `LDAP_MOVE_USER`. `LDAP_CREATE_USER` takes an optional
+  `ou_path`, and `LDAP_LIST_USERS` returns each user's `ou_path` and `upn`.
+- **Users are found by uid anywhere in the tenant.** A uid is unique across the
+  whole tenant, whatever OU it is in. Update, delete, password, group and
+  lookup commands search for it instead of assuming `uid=X,ou=users,…`.
+- **Moves stay inside the tenant.** A user moves between OUs of its own tenant;
+  every path is built from the tenant slug, so a user can never be moved into
+  another tenant.
+- **Group memberships follow.** Groups are `groupOfNames` and store member DNs,
+  so moving a user or renaming an OU rewrites those member values in the
+  tenant's groups. The spoke does this itself, so no `refint` overlay is needed
+  (it may manage a remote server it can't reconfigure).
+- **Delete is safe.** Only an empty OU (no users, no child OUs) can be deleted,
+  and the `ou=users` root can't be renamed or deleted.
+- **Downstream readers must search the subtree.** Anything that reads users
+  (ClearPass, applications) must search `ou=users,ou=<tenant>,…` with subtree
+  scope, or it will miss users in OUs.
+- **A failed move is undone, or reported.** If rewriting group members fails,
+  the spoke undoes the move. If the undo also fails, the reply has
+  `error: PARTIAL_ROLLBACK` and a message listing what is still changed.
+- **A tenant that was never provisioned is an error.** With no `ou=users`,
+  every OU and user command (list, create, rename, delete, move, password,
+  group membership) returns `ERROR` with `error: NOT_PROVISIONED`, never an
+  empty list, "user not found" or "OU not found". A provisioned tenant whose
+  `ou=groups` is gone gets a plain `ERROR` from `LDAP_LIST_GROUPS`
+  ("groups container missing"), and a user deleted while it is being moved
+  gets "user not found", not "OU not found". Invalid input (a malformed name
+  or path, or renaming or deleting the root `ou=users`) is refused before the
+  directory is asked, so it gets its own message in every tenant.
+- **A malformed path is an error.** A path must be a list of non-blank names
+  or an `A/B` string; `None`, `""` or `[]` mean the top level. Anything else
+  (`"/"`, `"A//B"`, a number) is refused, never read as the top level.
+
 ## Key files
 
 `src/main.py`, `src/ldap_spoke.py`, `src/ldap_manager.py` (~300 lines, whole `LdapManager`), `install_ldap.sh`, `base_structure.ldif` (reference OU/user template, not auto-applied), `tests/test_install_cert.py` (INSTALL_CERT unit tests, stubs python-ldap), `README.md`, `.env.template`, `requirements.txt`, `VERSION`.
