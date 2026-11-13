@@ -132,13 +132,130 @@ def groups_container_dn(base_dn: str, tenant_slug: Optional[str] = None) -> str:
     return f"ou=groups,{_base(base_dn)}"
 
 
-def user_dn(base_dn: str, uid: str, tenant_slug: Optional[str] = None) -> str:
-    """``uid=<uid>,ou=users,[ou=<slug>,]<base>``."""
+def user_dn(base_dn: str, uid: str, tenant_slug: Optional[str] = None,
+            ou_path: Optional[list] = None) -> str:
+    """``uid=<uid>,[ou=<OU>,...]ou=users,[ou=<slug>,]<base>``.
+
+    ``ou_path`` places the user in an OU below ``ou=users`` (top down)."""
     # A blank uid would produce an invalid DN.
     if not (uid or "").strip():
         raise ValueError("uid is required")
-    # Escape the uid and place it under the right users container.
-    return f"uid={escape_rdn_value(uid)},{users_container_dn(base_dn, tenant_slug)}"
+    # Escape the uid and place it under the right users container or OU.
+    parent = (ou_path_dn(base_dn, tenant_slug, ou_path) if ou_path
+              else users_container_dn(base_dn, tenant_slug))
+    return f"uid={escape_rdn_value(uid)},{parent}"
+
+
+def clean_ou_name(name: Optional[str]) -> str:
+    """Validate one OU (folder) name typed by a tenant admin.
+
+    Escaping already makes any text safe inside a DN; this only rejects names
+    that would confuse people: blank, padded, over 64 characters, or containing
+    a "/" (the UI shows OU paths as ``Engineering/Lab``)."""
+    # Trim and check the name; a bad name is a caller error.
+    n = (name or "").strip()
+    if not n or len(n) > 64 or "/" in n:
+        raise ValueError(f"invalid OU name {name!r}: 1-64 characters, no '/'")
+    return n
+
+
+def ou_path_dn(base_dn: str, tenant_slug: str, path: Optional[list] = None) -> str:
+    """DN of an OU inside a tenant's ``ou=users`` container.
+
+    ``path`` lists OU names from the top down, so ``["Engineering", "Lab"]``
+    gives ``ou=Lab,ou=Engineering,ou=users,ou=<slug>,<base>``. An empty path
+    is the ``ou=users`` container itself."""
+    # Start at the tenant's users container and add each OU on top of it.
+    dn = users_container_dn(base_dn, tenant_slug)
+    for name in path or []:
+        dn = f"ou={escape_rdn_value(clean_ou_name(name))},{dn}"
+    return dn
+
+
+def parse_dn(dn: str) -> list:
+    """Split a DN into ``[(attr, value), ...]`` with escapes removed.
+
+    Handles both escape forms servers send back: ``\\,`` and the hex form
+    ``\\2C``. Multi-valued RDNs (``a=1+b=2``) are not used in this directory
+    and are returned as one value."""
+    out = []
+    for rdn in split_dn_raw(dn):
+        attr, _, value = rdn.strip().partition("=")
+        out.append((attr.strip().lower(), _unescape(value.strip())))
+    return out
+
+
+def _unescape(value: str) -> str:
+    """Remove DN escaping (``\\,`` and hex ``\\2C``) from one RDN value."""
+    # Collect bytes so multi-byte UTF-8 hex escapes decode correctly.
+    raw, i = bytearray(), 0
+    while i < len(value):
+        ch = value[i]
+        if ch == "\\" and i + 1 < len(value):
+            pair = value[i + 1:i + 3]
+            if len(pair) == 2 and all(c in "0123456789abcdefABCDEF" for c in pair):
+                raw.append(int(pair, 16))
+                i += 3
+                continue
+            raw.extend(value[i + 1].encode("utf-8"))
+            i += 2
+            continue
+        raw.extend(ch.encode("utf-8"))
+        i += 1
+    return raw.decode("utf-8", "replace")
+
+
+def ou_path_of(dn: str, container_dn: str) -> Optional[list]:
+    """OU path of the entry ``dn`` relative to ``container_dn``.
+
+    For a user ``uid=bob,ou=Lab,ou=Engineering,ou=users,...`` with the users
+    container, returns ``["Engineering", "Lab"]`` (the OUs the user sits in).
+    For an OU entry, the path includes the OU itself. Returns None when the
+    entry is not under the container. Comparison is case-insensitive, like
+    LDAP's own DN matching."""
+    # Compare parsed RDNs so escaping differences do not matter.
+    entry = parse_dn(dn)
+    base = parse_dn(container_dn)
+    if len(entry) <= len(base):
+        return None
+    tail = entry[len(entry) - len(base):]
+    if [(a, v.lower()) for a, v in tail] != [(a, v.lower()) for a, v in base]:
+        return None
+    # The RDNs between the entry and the container are its OUs, bottom up.
+    between = entry[:len(entry) - len(base)]
+    names = [v for a, v in between if a == "ou"]
+    # A user's own uid= RDN is not part of its path; an OU's own RDN is.
+    return list(reversed(names))
+
+
+def split_dn_raw(dn: str) -> list:
+    """Split a DN on its unescaped commas, keeping each RDN's escaping as-is."""
+    # Walk the DN, skipping the character after each backslash.
+    parts, start, i = [], 0, 0
+    while i < len(dn):
+        if dn[i] == "\\":
+            i += 2
+            continue
+        if dn[i] == ",":
+            parts.append(dn[start:i])
+            start = i + 1
+        i += 1
+    parts.append(dn[start:])
+    return parts
+
+
+def rebase_dn(dn: str, old_base: str, new_base: str) -> str:
+    """Return ``dn`` with its ``old_base`` suffix replaced by ``new_base``.
+
+    Used when an OU is renamed: every entry below it gets a new DN. The suffix
+    is counted in RDNs, not characters, so it works however the server escaped
+    or cased the DN it returned."""
+    # Keep the RDNs above the old base and put them on the new base.
+    raw = split_dn_raw(dn)
+    keep = len(raw) - len(split_dn_raw(old_base))
+    if keep < 0:
+        raise ValueError(f"{dn!r} is not below {old_base!r}")
+    return ",".join(raw[:keep] + [new_base])
 
 
 def group_dn(base_dn: str, cn: str, tenant_slug: Optional[str] = None) -> str:

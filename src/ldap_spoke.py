@@ -24,6 +24,8 @@ except ImportError:
 
 # Directory operations and the bind-failure exception.
 from .ldap_manager import LdapManager, LdapBindError
+# Read-only Active Directory source (server discovery + failover).
+from .ad_directory import AdDirectory
 # Replication LDIF builders, imported package-relative or plain.
 try:
     from . import replication
@@ -32,6 +34,20 @@ except ImportError:  # loaded outside the src package
 
 # One named logger for the spoke.
 logger = logging.getLogger("LdapSpoke")
+
+
+def _ou_path(value) -> list:
+    """Normalise an OU path from a command payload to a list of names.
+
+    Accepts a list (``["Engineering", "Lab"]``) or a ``/``-separated string
+    (``"Engineering/Lab"``); None or empty means the ``ou=users`` container."""
+    # A string is split on "/"; blank segments are dropped.
+    if isinstance(value, str):
+        return [p for p in value.split("/") if p.strip()]
+    # A list is kept as text; anything else means "no path".
+    if isinstance(value, (list, tuple)):
+        return [str(p) for p in value]
+    return []
 
 
 class _CertInstallError(Exception):
@@ -260,7 +276,8 @@ class LdapSpoke(BaseSpoke):
             return await self._ldap_write(
                 self.manager.create_user_scoped,
                 data.get("uid"), data.get("attrs") or {}, data.get("tenant_slug"),
-                data.get("auth_mode", "local"), data.get("upn"), data.get("password"))
+                data.get("auth_mode", "local"), data.get("upn"), data.get("password"),
+                _ou_path(data.get("ou_path")))
 
         if normalized_cmd == "LDAP_UPDATE_USER":
             return await self._ldap_write(
@@ -311,6 +328,45 @@ class LdapSpoke(BaseSpoke):
             return await self._ldap_write(
                 self.manager.get_user_groups,
                 data.get("uid"), data.get("tenant_slug"))
+
+        # OUs (folders) inside the tenant's ou=users. Paths are lists of OU
+        # names, top down; every path stays inside the given tenant.
+        if normalized_cmd == "LDAP_LIST_OUS":
+            return await self._ldap_write(self.manager.list_ous_scoped, data.get("tenant_slug"))
+
+        if normalized_cmd == "LDAP_CREATE_OU":
+            return await self._ldap_write(
+                self.manager.create_ou_scoped, data.get("name"),
+                _ou_path(data.get("parent_path")), data.get("tenant_slug"))
+
+        if normalized_cmd == "LDAP_RENAME_OU":
+            return await self._ldap_write(
+                self.manager.rename_ou_scoped, _ou_path(data.get("path")),
+                data.get("new_name"), data.get("tenant_slug"))
+
+        if normalized_cmd == "LDAP_DELETE_OU":
+            return await self._ldap_write(
+                self.manager.delete_ou_scoped, _ou_path(data.get("path")),
+                data.get("tenant_slug"))
+
+        if normalized_cmd == "LDAP_MOVE_USER":
+            return await self._ldap_write(
+                self.manager.move_user_scoped, data.get("uid"),
+                _ou_path(data.get("target_path")), data.get("tenant_slug"))
+
+        # Active Directory (read-only stub), from the "ad" block of the
+        # spoke config. Blocking DNS/LDAP work runs in a worker thread.
+        if normalized_cmd in ("AD_DISCOVER", "AD_TEST", "AD_SEARCH_USERS"):
+            ad = AdDirectory(self.config.get("ad") or {})
+            if normalized_cmd == "AD_DISCOVER":
+                return await asyncio.to_thread(ad.discover)
+            if normalized_cmd == "AD_TEST":
+                return await asyncio.to_thread(ad.test)
+            try:
+                limit = int(data.get("limit") or 200)
+            except (TypeError, ValueError):
+                return {"status": "ERROR", "message": "limit must be a number"}
+            return await asyncio.to_thread(ad.search_users, data.get("q") or "", limit)
 
         if normalized_cmd == "INSTALL_CERT":
             # Hub-brokered Let's Encrypt cert install. The le spoke issued/
