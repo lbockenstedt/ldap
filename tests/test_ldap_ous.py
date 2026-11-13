@@ -320,3 +320,24 @@ def test_failed_group_rewrite_rolls_back_move_and_rename(env, monkeypatch):
     assert f"ou=Eng,{USERS}".lower() in fake.e
     assert f"ou=Engineering,{USERS}".lower() not in fake.e
     assert _members(fake) == before_members
+
+
+def test_failed_rollback_is_reported_as_partial(env, monkeypatch):
+    mgr, fake = env
+    real_rename = fake.rename_s
+    renames = {"n": 0}
+
+    def rename_once(*a):
+        # The move's rename works; the rollback's rename fails.
+        renames["n"] += 1
+        if renames["n"] > 1:
+            raise fake.ldap.LDAPError("server busy")
+        return real_rename(*a)
+
+    def failing_modify(dn, modlist):
+        raise fake.ldap.LDAPError("group write refused")
+    monkeypatch.setattr(fake, "rename_s", rename_once)
+    monkeypatch.setattr(fake, "modify_s", failing_modify)
+    res = mgr.move_user_scoped("alice", ["Sales"], "acme")
+    assert res["status"] == "ERROR" and res["error"] == "PARTIAL_ROLLBACK"
+    assert f"still at uid=alice,ou=Sales,{USERS}" in res["message"]

@@ -36,18 +36,31 @@ except ImportError:  # loaded outside the src package
 logger = logging.getLogger("LdapSpoke")
 
 
-def _ou_path(value) -> list:
+def _ou_path(value):
     """Normalise an OU path from a command payload to a list of names.
 
-    Accepts a list (``["Engineering", "Lab"]``) or a ``/``-separated string
-    (``"Engineering/Lab"``); None or empty means the ``ou=users`` container."""
-    # A string is split on "/"; blank segments are dropped.
+    Accepts a list of names (``["Engineering", "Lab"]``) or a ``/``-separated
+    string (``"Engineering/Lab"``); None, ``""`` or ``[]`` means the
+    ``ou=users`` container. Anything else (a blank segment, a non-string)
+    returns None, so a malformed path is an error and is never mistaken for
+    "the root"."""
+    # Absent or empty: the root users container.
+    if value is None or value == "":
+        return []
+    # A string is split on "/"; a list is taken as is.
     if isinstance(value, str):
-        return [p for p in value.split("/") if p.strip()]
-    # A list is kept as text; anything else means "no path".
-    if isinstance(value, (list, tuple)):
-        return [str(p) for p in value]
-    return []
+        value = value.split("/")
+    # Every segment must be a non-blank name: "/", " " or "A//B" is malformed,
+    # not the root or a guess at what was meant.
+    if isinstance(value, (list, tuple)) and all(isinstance(p, str) and p.strip() for p in value):
+        return list(value)
+    return None
+
+
+# Commands that take an OU path, and the payload key that holds it.
+_OU_PATH_KEYS = {"LDAP_CREATE_USER": "ou_path", "LDAP_CREATE_OU": "parent_path",
+                 "LDAP_RENAME_OU": "path", "LDAP_DELETE_OU": "path",
+                 "LDAP_MOVE_USER": "target_path"}
 
 
 class _CertInstallError(Exception):
@@ -271,6 +284,11 @@ class LdapSpoke(BaseSpoke):
         if normalized_cmd == "LDAP_PROVISION_TENANT_OU":
             return await self._ldap_write(
                 self.manager.provision_tenant_ou, data.get("tenant_slug"))
+
+        # A malformed OU path is an error, never a silent "move to the root".
+        if normalized_cmd in _OU_PATH_KEYS and _ou_path(data.get(_OU_PATH_KEYS[normalized_cmd])) is None:
+            return {"status": "ERROR",
+                    "message": f"{_OU_PATH_KEYS[normalized_cmd]} must be a list of OU names or an 'A/B' string"}
 
         if normalized_cmd == "LDAP_CREATE_USER":
             return await self._ldap_write(

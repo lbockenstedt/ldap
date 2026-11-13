@@ -80,6 +80,11 @@ class LdapBindError(Exception):
 _UID_LOCK = threading.Lock()
 
 
+class PartialRollbackError(Exception):
+    """A failed move/rename whose undo also failed: the directory is left
+    partly changed, and the message lists what is still changed."""
+
+
 class LdapManager:
     """Synchronous LDAP CRUD wrapper over ``python-ldap``.
 
@@ -950,18 +955,27 @@ class LdapManager:
         done: list = []
         try:
             return self._rewrite_memberships(conn, tenant_slug, moved, done)
-        except ldap.LDAPError:
-            # Undo the group changes (newest first), then the rename.
+        except ldap.LDAPError as exc:
+            # Undo the group changes (newest first), then the rename; note any
+            # step that could not be undone.
+            stuck = []
             for gdn, old_vals, new_vals in reversed(done):
                 try:
                     conn.modify_s(gdn, [(ldap.MOD_ADD, 'member', old_vals),
                                         (ldap.MOD_DELETE, 'member', new_vals)])
                 except ldap.LDAPError as e:
                     logger.error(f"Rollback of group {gdn} failed: {e}")
+                    stuck.append(f"group {gdn}")
             try:
                 conn.rename_s(new_dn, old_parts[0], ",".join(old_parts[1:]), 1)
             except ldap.LDAPError as e:
                 logger.error(f"Rollback of move {new_dn} -> {old_dn} failed: {e}")
+                stuck.append(f"entry is still at {new_dn}")
+            # Clean undo: report the original error. Partial undo: say exactly
+            # what was left changed, so it is never read as "nothing happened".
+            if stuck:
+                raise PartialRollbackError(
+                    f"{exc}; the change could not be fully undone: " + "; ".join(stuck)) from exc
             raise
 
     def _users_below(self, conn, dn: str) -> List[str]:
@@ -999,6 +1013,8 @@ class LdapManager:
             return {"status": "ERROR", "message": "OU not found: " + "/".join(path)}
         except ldap.ALREADY_EXISTS:
             return {"status": "ERROR", "message": f"OU already exists: {clean}"}
+        except PartialRollbackError as e:
+            return {"status": "ERROR", "error": "PARTIAL_ROLLBACK", "message": str(e)}
         except ldap.LDAPError as e:
             logger.error(f"Error renaming OU {old_dn}: {e}")
             return {"status": "ERROR", "message": str(e)}
@@ -1054,6 +1070,8 @@ class LdapManager:
                     "groups_updated": groups}
         except ValueError as e:
             return {"status": "ERROR", "message": str(e)}
+        except PartialRollbackError as e:
+            return {"status": "ERROR", "error": "PARTIAL_ROLLBACK", "message": str(e)}
         except ldap.NO_SUCH_OBJECT:
             return {"status": "ERROR", "message": "OU not found: " + "/".join(target_path or [])}
         except ldap.LDAPError as e:

@@ -70,6 +70,12 @@ The WebUI shows an OU as a path such as `Engineering/Lab`.
 - **Downstream readers must search the subtree.** Anything that reads users
   (ClearPass, applications) must search `ou=users,ou=<tenant>,…` with subtree
   scope, or it will miss users in OUs.
+- **A failed move is undone, or reported.** If rewriting group members fails,
+  the spoke undoes the move. If the undo also fails, the reply has
+  `error: PARTIAL_ROLLBACK` and a message listing what is still changed.
+- **A malformed path is an error.** A path must be a list of non-blank names
+  or an `A/B` string; `None`, `""` or `[]` mean the top level. Anything else
+  (`"/"`, `"A//B"`, a number) is refused, never read as the top level.
 
 ## Active Directory (read-only stub)
 
