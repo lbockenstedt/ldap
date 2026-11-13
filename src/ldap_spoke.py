@@ -24,6 +24,8 @@ except ImportError:
 
 # Directory operations and the bind-failure exception.
 from .ldap_manager import LdapManager, LdapBindError, TenantNotProvisionedError
+# Read-only Active Directory source (server discovery + failover).
+from .ad_directory import AdDirectory
 # Replication LDIF builders, imported package-relative or plain.
 try:
     from . import replication
@@ -372,6 +374,30 @@ class LdapSpoke(BaseSpoke):
             return await self._ldap_write(
                 self.manager.move_user_scoped, data.get("uid"),
                 _ou_path(data.get("target_path")), data.get("tenant_slug"))
+
+        # Active Directory (read-only). The hub sends the tenant's AD
+        # connection in every command (``ad``), with the bind password taken
+        # from the Credential Vault at send time, so the spoke never stores
+        # it. Blocking DNS/LDAP work runs in a worker thread.
+        if normalized_cmd in ("AD_DISCOVER", "AD_TEST", "AD_SEARCH_USERS"):
+            if not isinstance(data.get("ad"), dict):
+                return {"status": "ERROR", "error": "NOT_CONFIGURED",
+                        "message": "no Active Directory connection in the command"}
+            ad = AdDirectory(data["ad"])
+            # A connection without a domain (or with discovery off and no
+            # servers) is "not configured" for every AD command alike.
+            if not ad.configured():
+                return {"status": "ERROR", "error": "NOT_CONFIGURED",
+                        "message": "the Active Directory connection needs a domain and a server or discovery"}
+            if normalized_cmd == "AD_DISCOVER":
+                return await asyncio.to_thread(ad.discover)
+            if normalized_cmd == "AD_TEST":
+                return await asyncio.to_thread(ad.test)
+            try:
+                limit = int(data.get("limit") or 200)
+            except (TypeError, ValueError):
+                return {"status": "ERROR", "message": "limit must be a number"}
+            return await asyncio.to_thread(ad.search_users, data.get("q") or "", limit)
 
         if normalized_cmd == "INSTALL_CERT":
             # Hub-brokered Let's Encrypt cert install. The le spoke issued/
