@@ -240,3 +240,31 @@ def test_ldap_list_on_unprovisioned_tenant_is_not_provisioned_not_empty():
         res = _run(sp.handle_command(cmd, {"tenant_slug": "newco"}))
         assert res == {"status": "ERROR", "error": "NOT_PROVISIONED",
                        "message": "this tenant's directory is not provisioned"}, res
+
+
+def test_ad_commands_use_the_connection_sent_with_the_command(monkeypatch):
+    seen = []
+
+    class _FakeAd:
+        def __init__(self, cfg):
+            self.cfg = cfg
+            seen.append(cfg)
+
+        def configured(self):
+            return bool(self.cfg.get("domain"))
+
+        def test(self):
+            return {"status": "SUCCESS", "server": "dc1"}
+    monkeypatch.setattr(spoke_mod, "AdDirectory", _FakeAd)
+    sp = LdapSpoke("ldap-1", {"ad": {"domain": "stale.example", "bind_password": "old"}})
+    conn = {"domain": "corp.example", "bind_password": "from-vault"}
+    assert _run(sp.handle_command("AD_TEST", {"ad": conn})) == {"status": "SUCCESS", "server": "dc1"}
+    # The spoke's own config is never used for AD.
+    assert seen == [conn]
+    # No connection, or one with no domain, is NOT_CONFIGURED for every verb.
+    blank = {"bind_password": "x"}
+    for cmd in ("AD_TEST", "AD_DISCOVER", "AD_SEARCH_USERS"):
+        for data in ({}, {"ad": blank}):
+            res = _run(sp.handle_command(cmd, data))
+            assert res["status"] == "ERROR" and res["error"] == "NOT_CONFIGURED", (cmd, res)
+    assert seen == [conn] + [blank] * 3
