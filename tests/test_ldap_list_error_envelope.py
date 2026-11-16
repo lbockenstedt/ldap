@@ -217,6 +217,43 @@ def test_write_during_an_in_flight_read_prevents_stale_cache():
     assert len(calls) == 2
 
 
+def _prime(sp, calls):
+    sp.manager.list_ous_scoped = lambda slug: (calls.append(slug),
+                                               {"status": "SUCCESS", "ous": []})[1]
+    _run(sp.handle_command("LDAP_LIST_OUS", {"tenant_slug": "lrb"}))
+
+
+def test_partial_rollback_invalidates_the_cache():
+    sp = _spoke()
+    calls = []
+    _prime(sp, calls)
+    sp.manager.move_user_scoped = lambda *a: {"status": "ERROR", "error": "PARTIAL_ROLLBACK"}
+    _run(sp.handle_command("LDAP_MOVE_USER", {"uid": "a", "target_path": "X", "tenant_slug": "lrb"}))
+    _run(sp.handle_command("LDAP_LIST_OUS", {"tenant_slug": "lrb"}))
+    assert len(calls) == 2
+
+
+def test_update_config_clears_the_cache():
+    sp = _spoke()
+    calls = []
+    _prime(sp, calls)
+    _run(sp.handle_command("UPDATE_CONFIG", {"LDAP_BASE_DN": "dc=x,dc=y"}))
+    sp.manager.list_ous_scoped = lambda slug: (calls.append(slug),
+                                               {"status": "SUCCESS", "ous": []})[1]
+    _run(sp.handle_command("LDAP_LIST_OUS", {"tenant_slug": "lrb"}))
+    assert len(calls) == 2
+
+
+def test_legacy_dn_write_clears_the_cache():
+    sp = _spoke()
+    calls = []
+    _prime(sp, calls)
+    sp.manager.delete_entity = lambda dn: {"status": "SUCCESS"}
+    _run(sp.handle_command("DELETE_ENTITY", {"dn": "ou=x"}))
+    _run(sp.handle_command("LDAP_LIST_OUS", {"tenant_slug": "lrb"}))
+    assert len(calls) == 2
+
+
 def test_success_path_still_wraps_data():
     sp = _spoke()
     sp.manager.list_ous = lambda: [{"name": "users", "dn": "ou=users,dc=example,dc=org"}]
