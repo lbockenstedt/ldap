@@ -16,6 +16,7 @@ list methods to raise.
 import asyncio
 import importlib.util
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -133,6 +134,87 @@ def test_list_users_invalid_credentials_returns_clean_envelope():
     res = _run(sp.handle_command("LIST_USERS", {}))
     assert res["status"] == "ERROR"
     assert res["error"] == "INVALID_CREDENTIALS"
+
+
+def test_list_ous_served_from_cache_within_ttl():
+    # Counting fake: a repeated read inside the TTL makes ONE LDAP call.
+    sp = _spoke()
+    calls = []
+    sp.manager.list_ous_scoped = lambda slug: (calls.append(slug),
+                                               {"status": "SUCCESS", "ous": []})[1]
+    _run(sp.handle_command("LDAP_LIST_OUS", {"tenant_slug": "lrb"}))
+    _run(sp.handle_command("LDAP_LIST_OUS", {"tenant_slug": "lrb"}))
+    assert len(calls) == 1
+
+
+def test_ou_cache_is_per_tenant():
+    sp = _spoke()
+    calls = []
+    sp.manager.list_ous_scoped = lambda slug: (calls.append(slug),
+                                               {"status": "SUCCESS", "ous": []})[1]
+    _run(sp.handle_command("LDAP_LIST_OUS", {"tenant_slug": "lrb"}))
+    _run(sp.handle_command("LDAP_LIST_OUS", {"tenant_slug": "other"}))
+    assert calls == ["lrb", "other"]
+
+
+def test_concurrent_misses_are_coalesced():
+    # Single-flight: five simultaneous misses make one LDAP call.
+    sp = _spoke()
+    calls = []
+
+    def slow(slug):
+        calls.append(slug)
+        time.sleep(0.05)
+        return {"status": "SUCCESS", "ous": []}
+
+    sp.manager.list_ous_scoped = slow
+
+    async def many():
+        return await asyncio.gather(*[
+            sp.handle_command("LDAP_LIST_OUS", {"tenant_slug": "lrb"})
+            for _ in range(5)])
+
+    _run(many())
+    assert len(calls) == 1
+
+
+def test_failed_read_is_not_cached():
+    sp = _spoke()
+    calls = []
+    sp.manager.list_ous_scoped = lambda slug: (calls.append(slug),
+                                               {"status": "ERROR", "message": "boom"})[1]
+    _run(sp.handle_command("LDAP_LIST_OUS", {"tenant_slug": "lrb"}))
+    _run(sp.handle_command("LDAP_LIST_OUS", {"tenant_slug": "lrb"}))
+    assert len(calls) == 2
+
+
+def test_successful_write_invalidates_the_cache():
+    sp = _spoke()
+    calls = []
+    sp.manager.list_ous_scoped = lambda slug: (calls.append(slug),
+                                               {"status": "SUCCESS", "ous": []})[1]
+    sp.manager.create_ou_scoped = lambda name, parent, slug: {"status": "SUCCESS"}
+    _run(sp.handle_command("LDAP_LIST_OUS", {"tenant_slug": "lrb"}))
+    _run(sp.handle_command("LDAP_CREATE_OU", {"tenant_slug": "lrb", "name": "Lab"}))
+    _run(sp.handle_command("LDAP_LIST_OUS", {"tenant_slug": "lrb"}))
+    assert len(calls) == 2
+
+
+def test_write_during_an_in_flight_read_prevents_stale_cache():
+    # A write landing while the read is in flight bumps the generation, so the
+    # pre-write answer is returned but never stored.
+    sp = _spoke()
+    calls = []
+
+    def racing(slug):
+        calls.append(slug)
+        sp._ou_cache_invalidate(slug)
+        return {"status": "SUCCESS", "ous": ["stale"]}
+
+    sp.manager.list_ous_scoped = racing
+    _run(sp.handle_command("LDAP_LIST_OUS", {"tenant_slug": "lrb"}))
+    _run(sp.handle_command("LDAP_LIST_OUS", {"tenant_slug": "lrb"}))
+    assert len(calls) == 2
 
 
 def test_success_path_still_wraps_data():

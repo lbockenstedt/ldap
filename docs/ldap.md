@@ -55,6 +55,13 @@ The WebUI shows an OU as a path such as `Engineering/Lab`.
 - **Commands:** `LDAP_LIST_OUS`, `LDAP_CREATE_OU`, `LDAP_RENAME_OU`,
   `LDAP_DELETE_OU` and `LDAP_MOVE_USER`. `LDAP_CREATE_USER` takes an optional
   `ou_path`, and `LDAP_LIST_USERS` returns each user's `ou_path` and `upn`.
+  `LDAP_LIST_OUS` is polled by the Directory view, so the spoke answers it from
+  a per-tenant in-memory cache with a 5-minute TTL (single-flight, so
+  simultaneous misses make one LDAP call). A successful OU-affecting write
+  (`LDAP_CREATE_OU`, `LDAP_RENAME_OU`, `LDAP_DELETE_OU`, `LDAP_MOVE_USER`,
+  `LDAP_CREATE_USER`, `LDAP_DELETE_USER`) invalidates that tenant's entry
+  afterwards, and a read that was already in flight cannot put the pre-write
+  list back.
 - **Users are found by uid anywhere in the tenant.** A uid is unique across the
   whole tenant, whatever OU it is in. Update, delete, password, group and
   lookup commands search for it instead of assuming `uid=X,ou=users,…`.
