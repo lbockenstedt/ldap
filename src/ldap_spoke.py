@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import shutil
+import time
 # Path handles certificate and .env file locations; typing is for hints only.
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -24,6 +25,7 @@ except ImportError:
 
 # Directory operations and the bind-failure exception.
 from .ldap_manager import LdapManager, LdapBindError, TenantNotProvisionedError
+from .ldap_dn import canonical_slug
 # Read-only Active Directory source (server discovery + failover).
 from .ad_directory import AdDirectory
 # Replication LDIF builders, imported package-relative or plain.
@@ -81,6 +83,99 @@ class LdapSpoke(BaseSpoke):
             base_dn=self.config.get("LDAP_BASE_DN", "dc=example,dc=org"),
             server_url=self.config.get("LDAP_SERVER_URL", "ldap://localhost:389")
         )
+        # Per-tenant TTL cache bounds slapd reads, not hub command volume.
+        # Hub-side background refresh and cached page rendering are still
+        # required to bound Directory view commands.
+        self._ou_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        # One lock per tenant gives single-flight: concurrent misses make one
+        # LDAP call instead of a stampede.
+        self._ou_cache_locks: Dict[str, asyncio.Lock] = {}
+        # Generation counter per tenant, bumped by every OU-affecting write so
+        # a read that was already in flight cannot store pre-write data.
+        self._ou_cache_gen: Dict[str, int] = {}
+
+    # Refresh floor for the OU list, in seconds (fleet-rules 4.8: minutes).
+    _OU_CACHE_TTL = 300
+
+    def _ou_cache_key(self, tenant_slug: Optional[str]) -> str:
+        """Use the manager's canonical identity; an absent slug means base level."""
+        return canonical_slug(tenant_slug) if tenant_slug else ""
+
+    def _ou_cache_invalidate(self, tenant_slug: Optional[str]) -> None:
+        """Drop a tenant's cached OU list and bump its generation.
+
+        Called AFTER a possibly mutating write: the bump also tells any
+        read still in flight that its result is pre-write, so it is returned to
+        that caller but never stored."""
+        try:
+            key = self._ou_cache_key(tenant_slug)
+        except ValueError:
+            # Invalid slugs cannot have cached entries; preserve the write's
+            # error envelope rather than raising during invalidation.
+            return
+        self._ou_cache_gen[key] = self._ou_cache_gen.get(key, 0) + 1
+        self._ou_cache.pop(key, None)
+
+    async def _list_ous_cached(self, tenant_slug: Optional[str]) -> Dict[str, Any]:
+        """Serve LDAP_LIST_OUS from the per-tenant TTL cache.
+
+        Steps: take the tenant's lock (single-flight), return a fresh cached
+        answer, otherwise ask slapd once; only a SUCCESS whose generation is
+        still current is cached, so errors are not cached and a write that
+        landed during the read wins."""
+        try:
+            key = self._ou_cache_key(tenant_slug)
+        except ValueError as exc:
+            return {"status": "ERROR", "message": str(exc)}
+        lock = self._ou_cache_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            entry = self._ou_cache.get(key)
+            if entry and (time.monotonic() - entry[0]) < self._OU_CACHE_TTL:
+                return entry[1]
+            gen = self._ou_cache_gen.get(key, 0)
+            result = await self._ldap_write(self.manager.list_ous_scoped, tenant_slug)
+            if (isinstance(result, dict) and result.get("status") == "SUCCESS"
+                    and self._ou_cache_gen.get(key, 0) == gen):
+                self._ou_cache[key] = (time.monotonic(), result)
+            return result
+
+    def _ou_cache_clear_all(self) -> None:
+        """Drop every tenant's cached OU list and bump every generation."""
+        for key in set(self._ou_cache) | set(self._ou_cache_gen) | set(self._ou_cache_locks):
+            self._ou_cache_invalidate(key)
+
+    @staticmethod
+    def _write_may_have_changed(result: Any) -> bool:
+        """Invalidate unless an explicit pre-mutation refusal proves no change.
+
+        SUCCESS, PARTIAL, PARTIAL_ROLLBACK and unknown outcomes all invalidate:
+        a generic LDAP error may arrive after the server committed a write.
+        Never infer a clean refusal from an unstructured error message.
+        """
+        return not (
+            isinstance(result, dict)
+            and result.get("status") == "ERROR"
+            and result.get("error") in ("NOT_PROVISIONED", "INVALID_CREDENTIALS")
+        )
+
+    async def _ldap_write_ou(self, tenant_slug: Optional[str], fn, *args) -> Dict[str, Any]:
+        """Run an OU-affecting write, then invalidate the tenant's OU cache.
+
+        Invalidation happens after any write not known to be a clean refusal,
+        including partial and unknown outcomes, so the next read refreshes and
+        an in-flight read cannot restore the old state."""
+        result = await self._ldap_write(fn, *args)
+        if self._write_may_have_changed(result):
+            self._ou_cache_invalidate(tenant_slug)
+        return result
+
+    async def _ldap_write_all_ou(self, fn, *args) -> Dict[str, Any]:
+        """Like _ldap_write_ou for DN-based commands that carry no tenant slug:
+        invalidates every tenant's cached OU list when the directory changed."""
+        result = await self._ldap_write(fn, *args)
+        if self._write_may_have_changed(result):
+            self._ou_cache_clear_all()
+        return result
 
     def _ldap_error_envelope(self, exc: Exception) -> Dict[str, Any]:
         """Map an ``ldap.LDAPError`` / :class:`LdapBindError` to a clean ERROR
@@ -185,6 +280,9 @@ class LdapSpoke(BaseSpoke):
                 base_dn=self.config.get("LDAP_BASE_DN", "dc=example,dc=org"),
                 server_url=self.config.get("LDAP_SERVER_URL", "ldap://localhost:389")
             )
+            # A new server/base DN invalidates every cached OU list (and any
+            # in-flight read from the old manager).
+            self._ou_cache_clear_all()
             # Collect notes about the extra side effects below.
             notes = []
             # Entra ROPC config changes: persist to .env so the pam_exec ROPC
@@ -216,17 +314,17 @@ class LdapSpoke(BaseSpoke):
             return await self._ldap_list(self.manager.list_ous)
 
         if normalized_cmd == "CREATE_OU":
-            return await self._ldap_write(self.manager.create_ou, data.get("name"), data.get("parent_dn"))
+            return await self._ldap_write_all_ou(self.manager.create_ou, data.get("name"), data.get("parent_dn"))
 
         if normalized_cmd == "UPDATE_OU":
-            return await self._ldap_write(self.manager.update_ou, data.get("dn"), data.get("name"))
+            return await self._ldap_write_all_ou(self.manager.update_ou, data.get("dn"), data.get("name"))
 
         # User listing and create/update by DN.
         if normalized_cmd == "LIST_USERS":
             return await self._ldap_list(self.manager.list_users)
 
         if normalized_cmd == "CREATE_USER":
-            return await self._ldap_write(
+            return await self._ldap_write_all_ou(
                 self.manager.create_user,
                 data.get("username"), data.get("first_name"), data.get("last_name"),
                 data.get("email"), data.get("ou_dn"), data.get("password"))
@@ -263,7 +361,7 @@ class LdapSpoke(BaseSpoke):
 
         # DELETE_ENTITY: delete any entry by DN.
         if normalized_cmd == "DELETE_ENTITY":
-            return await self._ldap_write(self.manager.delete_entity, data.get("dn"))
+            return await self._ldap_write_all_ou(self.manager.delete_entity, data.get("dn"))
 
         if normalized_cmd == "SEARCH_USERS":
             # Global-search leg (directory users/groups). Now NON-ADMIN ALLOWED
@@ -277,7 +375,7 @@ class LdapSpoke(BaseSpoke):
         if normalized_cmd == "LDAP_MIGRATE_TENANT":
             # Cross-tenant migration: re-home entries from source_base_dn to
             # target_base_dn (a tenant's ldap_base_dn changed).
-            return await self._ldap_write(
+            return await self._ldap_write_all_ou(
                 self.manager.migrate_tenant,
                 data.get("source_base_dn", ""), data.get("target_base_dn", ""),
                 bool(data.get("purge_source", False)))
@@ -285,7 +383,8 @@ class LdapSpoke(BaseSpoke):
         # ── Tenant-scoped commands (LDAP_* contract; TENANT == OU 1:1) ─────
         # All accept an optional tenant_slug; absent = base level (back-compat).
         if normalized_cmd == "LDAP_PROVISION_TENANT_OU":
-            return await self._ldap_write(
+            return await self._ldap_write_ou(
+                data.get("tenant_slug"),
                 self.manager.provision_tenant_ou, data.get("tenant_slug"))
 
         # A malformed OU path is an error, never a silent "move to the root".
@@ -294,7 +393,9 @@ class LdapSpoke(BaseSpoke):
                     "message": f"{_OU_PATH_KEYS[normalized_cmd]} must be a list of OU names or an 'A/B' string"}
 
         if normalized_cmd == "LDAP_CREATE_USER":
-            return await self._ldap_write(
+            # User counts are part of the OU list, so invalidate it.
+            return await self._ldap_write_ou(
+                data.get("tenant_slug"),
                 self.manager.create_user_scoped,
                 data.get("uid"), data.get("attrs") or {}, data.get("tenant_slug"),
                 data.get("auth_mode", "local"), data.get("upn"), data.get("password"),
@@ -306,7 +407,8 @@ class LdapSpoke(BaseSpoke):
                 data.get("uid"), data.get("attrs") or {}, data.get("tenant_slug"))
 
         if normalized_cmd == "LDAP_DELETE_USER":
-            return await self._ldap_write(
+            return await self._ldap_write_ou(
+                data.get("tenant_slug"),
                 self.manager.delete_user_scoped,
                 data.get("uid"), data.get("tenant_slug"))
 
@@ -353,25 +455,31 @@ class LdapSpoke(BaseSpoke):
         # OUs (folders) inside the tenant's ou=users. Paths are lists of OU
         # names, top down; every path stays inside the given tenant.
         if normalized_cmd == "LDAP_LIST_OUS":
-            return await self._ldap_write(self.manager.list_ous_scoped, data.get("tenant_slug"))
+            # Polled by the Directory view: served from the per-tenant TTL cache.
+            return await self._list_ous_cached(data.get("tenant_slug"))
 
         if normalized_cmd == "LDAP_CREATE_OU":
-            return await self._ldap_write(
+            return await self._ldap_write_ou(
+                data.get("tenant_slug"),
                 self.manager.create_ou_scoped, data.get("name"),
                 _ou_path(data.get("parent_path")), data.get("tenant_slug"))
 
         if normalized_cmd == "LDAP_RENAME_OU":
-            return await self._ldap_write(
+            return await self._ldap_write_ou(
+                data.get("tenant_slug"),
                 self.manager.rename_ou_scoped, _ou_path(data.get("path")),
                 data.get("new_name"), data.get("tenant_slug"))
 
         if normalized_cmd == "LDAP_DELETE_OU":
-            return await self._ldap_write(
+            return await self._ldap_write_ou(
+                data.get("tenant_slug"),
                 self.manager.delete_ou_scoped, _ou_path(data.get("path")),
                 data.get("tenant_slug"))
 
         if normalized_cmd == "LDAP_MOVE_USER":
-            return await self._ldap_write(
+            # A move changes the per-OU user counts in the list.
+            return await self._ldap_write_ou(
+                data.get("tenant_slug"),
                 self.manager.move_user_scoped, data.get("uid"),
                 _ou_path(data.get("target_path")), data.get("tenant_slug"))
 
