@@ -217,6 +217,130 @@ def test_write_during_an_in_flight_read_prevents_stale_cache():
     assert len(calls) == 2
 
 
+def _prime(sp, calls):
+    sp.manager.list_ous_scoped = lambda slug: (calls.append(slug),
+                                               {"status": "SUCCESS", "ous": []})[1]
+    _run(sp.handle_command("LDAP_LIST_OUS", {"tenant_slug": "lrb"}))
+
+
+def test_partial_rollback_invalidates_the_cache():
+    sp = _spoke()
+    calls = []
+    _prime(sp, calls)
+    sp.manager.move_user_scoped = lambda *a: {"status": "ERROR", "error": "PARTIAL_ROLLBACK"}
+    _run(sp.handle_command("LDAP_MOVE_USER", {"uid": "a", "target_path": "X", "tenant_slug": "lrb"}))
+    _run(sp.handle_command("LDAP_LIST_OUS", {"tenant_slug": "lrb"}))
+    assert len(calls) == 2
+
+
+def test_update_config_clears_the_cache():
+    sp = _spoke()
+    calls = []
+    _prime(sp, calls)
+    _run(sp.handle_command("UPDATE_CONFIG", {"LDAP_BASE_DN": "dc=x,dc=y"}))
+    sp.manager.list_ous_scoped = lambda slug: (calls.append(slug),
+                                               {"status": "SUCCESS", "ous": []})[1]
+    _run(sp.handle_command("LDAP_LIST_OUS", {"tenant_slug": "lrb"}))
+    assert len(calls) == 2
+
+
+def test_legacy_dn_write_clears_the_cache():
+    sp = _spoke()
+    calls = []
+    _prime(sp, calls)
+    sp.manager.delete_entity = lambda dn: {"status": "SUCCESS"}
+    _run(sp.handle_command("DELETE_ENTITY", {"dn": "ou=x"}))
+    _run(sp.handle_command("LDAP_LIST_OUS", {"tenant_slug": "lrb"}))
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("read_slug,write_slug", [
+    (" lrb ", "LRB"), ("lrb", " LRB "), (None, ""),
+])
+def test_ou_cache_uses_canonical_tenant_identity(read_slug, write_slug):
+    """Equivalent slugs share both cached reads and write invalidation."""
+    sp = _spoke()
+    calls = []
+    sp.manager.list_ous_scoped = lambda slug: (
+        calls.append(slug), {"status": "SUCCESS", "ous": []})[1]
+    sp.manager.create_ou_scoped = lambda *a: {"status": "SUCCESS"}
+    _run(sp.handle_command("LDAP_LIST_OUS", {"tenant_slug": read_slug}))
+    _run(sp.handle_command("LDAP_LIST_OUS", {"tenant_slug": write_slug}))
+    assert len(calls) == 1
+    _run(sp.handle_command("LDAP_CREATE_OU", {
+        "tenant_slug": write_slug, "name": "Lab"}))
+    _run(sp.handle_command("LDAP_LIST_OUS", {"tenant_slug": read_slug}))
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("slug", ["   ", "bad,slug"])
+def test_invalid_slug_cannot_read_the_base_cache(slug):
+    """Invalid tenant identities never alias a cached base-level listing."""
+    sp = _spoke()
+    calls = []
+    sp.manager.list_ous_scoped = lambda tenant: (
+        calls.append(tenant), {"status": "SUCCESS", "ous": []})[1]
+    _run(sp.handle_command("LDAP_LIST_OUS", {}))
+    result = _run(sp.handle_command("LDAP_LIST_OUS", {"tenant_slug": slug}))
+    assert result["status"] == "ERROR"
+    assert calls == [None]
+    sp.manager.create_ou_scoped = lambda *a: {"status": "ERROR", "message": "invalid slug"}
+    result = _run(sp.handle_command("LDAP_CREATE_OU", {
+        "tenant_slug": slug, "name": "Lab"}))
+    assert result == {"status": "ERROR", "message": "invalid slug"}
+
+
+def test_partial_migration_invalidates_every_tenant():
+    """A migration can move entries before returning PARTIAL."""
+    sp = _spoke()
+    calls = []
+    _prime(sp, calls)
+    _run(sp.handle_command("LDAP_LIST_OUS", {"tenant_slug": "other"}))
+    partial = {"status": "PARTIAL", "moved": ["uid=a,ou=users,dc=old"]}
+    sp.manager.migrate_tenant = lambda *a: partial
+    result = _run(sp.handle_command("LDAP_MIGRATE_TENANT", {
+        "source_base_dn": "dc=old", "target_base_dn": "dc=new"}))
+    assert result == partial
+    for slug in ("lrb", "other"):
+        _run(sp.handle_command("LDAP_LIST_OUS", {"tenant_slug": slug}))
+    assert calls == ["lrb", "other", "lrb", "other"]
+
+
+@pytest.mark.parametrize("command", ["LDAP_CREATE_OU", "DELETE_ENTITY"])
+@pytest.mark.parametrize("raises", [False, True])
+def test_unknown_write_outcome_invalidates_cache(command, raises):
+    """Returned and propagated LDAP failures may follow a committed write."""
+    sp = _spoke()
+    calls = []
+    _prime(sp, calls)
+
+    def uncertain_write(*args):
+        """Simulate a lost response after a possible directory mutation."""
+        if raises:
+            raise LDAPError("connection lost after write")
+        return {"status": "ERROR", "message": "connection lost after write"}
+
+    sp.manager.create_ou_scoped = uncertain_write
+    sp.manager.delete_entity = uncertain_write
+    result = _run(sp.handle_command(command, {
+        "tenant_slug": "lrb", "name": "Lab", "dn": "ou=Lab"}))
+    assert result["status"] == "ERROR"
+    _run(sp.handle_command("LDAP_LIST_OUS", {"tenant_slug": "lrb"}))
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("error", ["NOT_PROVISIONED", "INVALID_CREDENTIALS"])
+def test_known_clean_refusal_preserves_cache(error):
+    """Explicit pre-mutation refusals need not discard a valid cached read."""
+    sp = _spoke()
+    calls = []
+    _prime(sp, calls)
+    sp.manager.create_ou_scoped = lambda *a: {"status": "ERROR", "error": error}
+    _run(sp.handle_command("LDAP_CREATE_OU", {"tenant_slug": "lrb", "name": "Lab"}))
+    _run(sp.handle_command("LDAP_LIST_OUS", {"tenant_slug": "lrb"}))
+    assert len(calls) == 1
+
+
 def test_success_path_still_wraps_data():
     sp = _spoke()
     sp.manager.list_ous = lambda: [{"name": "users", "dn": "ou=users,dc=example,dc=org"}]
