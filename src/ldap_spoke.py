@@ -25,6 +25,7 @@ except ImportError:
 
 # Directory operations and the bind-failure exception.
 from .ldap_manager import LdapManager, LdapBindError, TenantNotProvisionedError
+from .ldap_dn import canonical_slug
 # Read-only Active Directory source (server discovery + failover).
 from .ad_directory import AdDirectory
 # Replication LDIF builders, imported package-relative or plain.
@@ -82,10 +83,9 @@ class LdapSpoke(BaseSpoke):
             base_dn=self.config.get("LDAP_BASE_DN", "dc=example,dc=org"),
             server_url=self.config.get("LDAP_SERVER_URL", "ldap://localhost:389")
         )
-        # TTL cache for LDAP_LIST_OUS, per tenant. The WebUI Directory view
-        # polls this read far more often than OUs change (the hub health check
-        # flagged ~3400 calls/hour against a 300/hour floor), so the answer is
-        # served from memory for a few minutes instead of hitting slapd.
+        # Per-tenant TTL cache bounds slapd reads, not hub command volume.
+        # Hub-side background refresh and cached page rendering are still
+        # required to bound Directory view commands.
         self._ou_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
         # One lock per tenant gives single-flight: concurrent misses make one
         # LDAP call instead of a stampede.
@@ -98,16 +98,21 @@ class LdapSpoke(BaseSpoke):
     _OU_CACHE_TTL = 300
 
     def _ou_cache_key(self, tenant_slug: Optional[str]) -> str:
-        """Return the cache key for a tenant slug (slugs are case-insensitive)."""
-        return (tenant_slug or "").lower()
+        """Use the manager's canonical identity; an absent slug means base level."""
+        return canonical_slug(tenant_slug) if tenant_slug else ""
 
     def _ou_cache_invalidate(self, tenant_slug: Optional[str]) -> None:
         """Drop a tenant's cached OU list and bump its generation.
 
-        Called AFTER a successful OU-affecting write: the bump also tells any
+        Called AFTER a possibly mutating write: the bump also tells any
         read still in flight that its result is pre-write, so it is returned to
         that caller but never stored."""
-        key = self._ou_cache_key(tenant_slug)
+        try:
+            key = self._ou_cache_key(tenant_slug)
+        except ValueError:
+            # Invalid slugs cannot have cached entries; preserve the write's
+            # error envelope rather than raising during invalidation.
+            return
         self._ou_cache_gen[key] = self._ou_cache_gen.get(key, 0) + 1
         self._ou_cache.pop(key, None)
 
@@ -118,7 +123,10 @@ class LdapSpoke(BaseSpoke):
         answer, otherwise ask slapd once; only a SUCCESS whose generation is
         still current is cached, so errors are not cached and a write that
         landed during the read wins."""
-        key = self._ou_cache_key(tenant_slug)
+        try:
+            key = self._ou_cache_key(tenant_slug)
+        except ValueError as exc:
+            return {"status": "ERROR", "message": str(exc)}
         lock = self._ou_cache_locks.setdefault(key, asyncio.Lock())
         async with lock:
             entry = self._ou_cache.get(key)
@@ -138,17 +146,24 @@ class LdapSpoke(BaseSpoke):
 
     @staticmethod
     def _write_may_have_changed(result: Any) -> bool:
-        """True unless the write was a clean refusal: SUCCESS or PARTIAL_ROLLBACK
-        (directory still changed) both count as changed."""
-        return isinstance(result, dict) and (
-            result.get("status") == "SUCCESS" or result.get("error") == "PARTIAL_ROLLBACK")
+        """Invalidate unless an explicit pre-mutation refusal proves no change.
+
+        SUCCESS, PARTIAL, PARTIAL_ROLLBACK and unknown outcomes all invalidate:
+        a generic LDAP error may arrive after the server committed a write.
+        Never infer a clean refusal from an unstructured error message.
+        """
+        return not (
+            isinstance(result, dict)
+            and result.get("status") == "ERROR"
+            and result.get("error") in ("NOT_PROVISIONED", "INVALID_CREDENTIALS")
+        )
 
     async def _ldap_write_ou(self, tenant_slug: Optional[str], fn, *args) -> Dict[str, Any]:
         """Run an OU-affecting write, then invalidate the tenant's OU cache.
 
-        Invalidation happens after the write when the directory changed
-        (SUCCESS or PARTIAL_ROLLBACK), so the next read sees the new state and
-        an in-flight read cannot restore the old one."""
+        Invalidation happens after any write not known to be a clean refusal,
+        including partial and unknown outcomes, so the next read refreshes and
+        an in-flight read cannot restore the old state."""
         result = await self._ldap_write(fn, *args)
         if self._write_may_have_changed(result):
             self._ou_cache_invalidate(tenant_slug)
