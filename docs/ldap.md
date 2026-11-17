@@ -55,13 +55,21 @@ The WebUI shows an OU as a path such as `Engineering/Lab`.
 - **Commands:** `LDAP_LIST_OUS`, `LDAP_CREATE_OU`, `LDAP_RENAME_OU`,
   `LDAP_DELETE_OU` and `LDAP_MOVE_USER`. `LDAP_CREATE_USER` takes an optional
   `ou_path`, and `LDAP_LIST_USERS` returns each user's `ou_path` and `upn`.
-  `LDAP_LIST_OUS` is polled by the Directory view, so the spoke answers it from
-  a per-tenant in-memory cache with a 5-minute TTL (single-flight, so
-  simultaneous misses make one LDAP call). A successful OU-affecting write
-  (`LDAP_CREATE_OU`, `LDAP_RENAME_OU`, `LDAP_DELETE_OU`, `LDAP_MOVE_USER`,
-  `LDAP_CREATE_USER`, `LDAP_DELETE_USER`) invalidates that tenant's entry
-  afterwards, and a read that was already in flight cannot put the pre-write
-  list back.
+  The spoke answers `LDAP_LIST_OUS` from a per-tenant in-memory cache with
+  a 5-minute TTL (single-flight, so simultaneous misses make one LDAP call).
+  Keys use the manager's canonical slug, including trimming whitespace.
+  OU-affecting writes (`LDAP_CREATE_OU`, `LDAP_RENAME_OU`, `LDAP_DELETE_OU`,
+  `LDAP_MOVE_USER`, `LDAP_CREATE_USER`, `LDAP_DELETE_USER`) invalidate that
+  tenant's entry afterwards unless explicitly refused before mutation.
+  Partial and unknown outcomes invalidate too, and an in-flight read cannot
+  put the pre-write list back. Legacy DN-based writes (`CREATE_OU`,
+  `UPDATE_OU`, `CREATE_USER`, `DELETE_ENTITY`, `LDAP_MIGRATE_TENANT`) clear
+  every tenant's entry under the same policy; `UPDATE_CONFIG` always clears
+  every entry. This bounds slapd reads only: it does not reduce hub-to-spoke
+  command or log volume and does not resolve the command-frequency alert.
+  The Directory view still requires a separate change in the hub repository
+  to render from its shared persisted cache and refresh in the background,
+  rather than polling this command on page renders.
 - **Users are found by uid anywhere in the tenant.** A uid is unique across the
   whole tenant, whatever OU it is in. Update, delete, password, group and
   lookup commands search for it instead of assuming `uid=X,ou=users,…`.
