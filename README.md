@@ -100,7 +100,7 @@ The following commands are handled by `LdapSpoke`:
 | `ADD_USER_TO_GROUP` | `user_dn`, `group_dn` | Adds a user's distinguished name to the target group's `member` list. |
 | `REMOVE_USER_FROM_GROUP` | `user_dn`, `group_dn` | Removes a user's distinguished name from the target group's `member` list. |
 | `SET_PASSWORD` | `user_dn`, `password` | Sets a user's password using the Password-Modify extended operation or direct `{SSHA}` hash update. |
-| `DELETE_ENTITY` | `dn` | Deletes any leaf directory entity (user, group, or OU) by DN. |
+| `DELETE_ENTITY` | `dn` | Deletes any leaf directory entity (user, group, or OU) by DN, and removes that DN from every group that lists it. |
 | `SEARCH_USERS` | `q`, `tenant`, `is_admin` | Global search query matching `uid`, `cn`, `mail`, and `dNSHostName` with tenant scoping. |
 | `LDAP_MIGRATE_TENANT` | `source_base_dn`, `target_base_dn`, `purge_source` | Re-homes directory entries from an old tenant base DN to a new target base DN. |
 | `LDAP_PROVISION_TENANT_OU` | `tenant_slug` | Idempotently provisions a tenant tree (`ou=<slug>`, `ou=users`, `ou=groups`). |
