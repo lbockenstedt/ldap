@@ -474,3 +474,19 @@ def test_ad_commands_use_the_connection_sent_with_the_command(monkeypatch):
             res = _run(sp.handle_command(cmd, data))
             assert res["status"] == "ERROR" and res["error"] == "NOT_CONFIGURED", (cmd, res)
     assert seen == [conn] + [blank] * 3
+
+
+def test_replication_errors_never_carry_the_admin_password():
+    """slapd can echo the rejected olcSyncrepl value; the UPDATE_CONFIG
+    reply must not pass the password on to the hub."""
+    sp = _spoke()
+    pw = 'Pa"ss w0rd'
+
+    async def _echo(ldif, tolerate=""):
+        return f'ldapmodify failed: olcSyncrepl: bad credentials="{pw}" rid=001 ({pw})'
+    sp._ldapmodify_tolerant = _echo
+    note = asyncio.run(sp._apply_replication_config({
+        "LDAP_SERVER_ID": "1", "LDAP_MIRROR_PEERS": '["ldap://peer:389"]',
+        "LDAP_BASE_DN": "dc=x", "LDAP_ADMIN_DN": "cn=admin,dc=x", "LDAP_ADMIN_PW": pw}))
+    assert "failed" in note and "credentials=***" in note
+    assert "w0rd" not in note
