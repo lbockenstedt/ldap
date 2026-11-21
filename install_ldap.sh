@@ -213,6 +213,23 @@ setup_repo_and_venv() {
 # =============================================================================
 # INFRA-ONLY: provision the slapd SERVER (zero-CLI, idempotent)
 # =============================================================================
+# Temp files that may hold a secret, removed on any exit. The EXIT trap runs
+# after the function that made them has returned, so it can't use that
+# function's locals; the paths live in this global list instead.
+_TMPFILES=()
+cleanup_tmpfiles() {
+    [ "${#_TMPFILES[@]}" -eq 0 ] || rm -f "${_TMPFILES[@]}"
+}
+
+# new_tmpfile VAR: create a 0600 mktemp file, register it for removal on exit
+# and store its path in VAR (a caller's local works: bash scope is dynamic).
+new_tmpfile() {
+    local f; f="$(mktemp)" || return 1
+    _TMPFILES+=("$f")
+    trap cleanup_tmpfiles EXIT
+    printf -v "$1" '%s' "$f"
+}
+
 # Apply an LDIF (stdin) to cn=config over ldapi as root (SASL EXTERNAL).
 # Re-runs are idempotent: "value already exists" (20) and "already exists" (68)
 # count as success. Any other failure is printed (never silently swallowed) and
@@ -221,6 +238,8 @@ apply_config_ldif() {
     local out rc
     out="$(ldapmodify -Q -Y EXTERNAL -H ldapi:/// 2>&1)" && rc=0 || rc=$?
     case "$rc" in 0|20|68) return 0 ;; esac
+    # slapd can echo a rejected olcSyncrepl value, which holds the password.
+    out="$(printf '%s' "$out" | sed -E 's/credentials=("([^"\\]|\\.)*"|[^[:space:]]+)/credentials=***/g')"
     echo "⚠️  ldapmodify (cn=config) failed rc=$rc: $out" >&2
     return "$rc"
 }
@@ -300,7 +319,14 @@ DEBCONF
         echo "❌ slapd rejects SASL EXTERNAL over ldapi:/// — cannot change cn=config." >&2
         exit 1
     fi
-    local HASH; HASH="$(slappasswd -s "$ADMIN_PW")"
+    # The password goes to slappasswd and ldapadd through a 0600 temp file
+    # (no trailing newline), never on argv where ps and /proc/<pid>/cmdline
+    # show it to every local user. new_tmpfile's EXIT trap removes the temp
+    # files if a step below exits the installer early.
+    local PWFILE TMPLDIF
+    new_tmpfile PWFILE || { echo "❌ mktemp failed." >&2; exit 1; }
+    printf '%s' "$ADMIN_PW" > "$PWFILE"
+    local HASH; HASH="$(slappasswd -T "$PWFILE")" || { echo "❌ slappasswd failed." >&2; exit 1; }
     apply_config_ldif <<LDIF || { echo "❌ setting the admin password failed." >&2; exit 1; }
 dn: olcDatabase={1}mdb,cn=config
 changetype: modify
@@ -312,14 +338,15 @@ olcRootPW: $HASH
 LDIF
 
     # 5. Apply the templated base structure (ou=users/ou=groups) idempotently.
-    local TMPLDIF="/tmp/lm-base-structure.ldif"
+    #    mktemp, not a fixed /tmp name another local user could pre-create.
+    new_tmpfile TMPLDIF || { echo "❌ mktemp failed." >&2; exit 1; }
     ./venv/bin/python3 -m src.ldif_template "$BASE_DN" base_structure.ldif > "$TMPLDIF"
     local out rc
-    out="$(ldapadd -x -D "$ADMIN_DN" -w "$ADMIN_PW" -H ldapi:/// -f "$TMPLDIF" 2>&1)" && rc=0 || rc=$?
+    out="$(ldapadd -x -D "$ADMIN_DN" -y "$PWFILE" -H ldapi:/// -f "$TMPLDIF" 2>&1)" && rc=0 || rc=$?
     if [ "${rc:-0}" -ne 0 ] && ! echo "$out" | grep -qi "Already exists"; then
         echo "⚠️  base structure apply reported: $out"
     fi
-    rm -f "$TMPLDIF"
+    rm -f "$TMPLDIF" "$PWFILE"
 
     # 6. Self-signed TLS so LDAPS works before the hub brokers a real cert
     #    (INSTALL_CERT later overwrites these same paths).
@@ -366,7 +393,7 @@ configure_self_signed_tls() {
     if [ -f "$TLS_DIR/slapd-key.pem" ]; then
         chmod 600 "$TLS_DIR/slapd-key.pem"; chmod 644 "$TLS_DIR/slapd-cert.pem"
         chown openldap:openldap "$TLS_DIR"/slapd-*.pem 2>/dev/null || true
-        apply_config_ldif <<LDIF || echo "⚠️  TLS cert config not applied; LDAPS may be unavailable."
+        apply_config_ldif <<LDIF && TLS_READY=1 || echo "⚠️  TLS cert config not applied; LDAPS may be unavailable."
 dn: cn=config
 changetype: modify
 replace: olcTLSCertificateFile
@@ -438,15 +465,31 @@ PAM
 # Configure 2-node syncrepl mirror-mode via the shared pure LDIF builders.
 configure_mirror_mode() {
     echo "🔁 Configuring syncrepl mirror-mode (server-id $SERVER_ID, ${#PEERS[@]} peer(s))..."
+    # syncrepl to an ldap:// peer requires StartTLS (starttls=critical), so a
+    # node without slapd TLS would never replicate: fail the deploy now.
+    if [ "${TLS_READY:-0}" != 1 ]; then
+        echo "❌ mirror-mode needs slapd TLS, which could not be configured." >&2
+        exit 1
+    fi
     # Order matters: module → overlay (provider) → serverID → syncrepl
     # (consumer) → mirrormode. Fatal on failure so a broken replication setup
     # is reported to the hub instead of a false "deployed successfully".
-    ./venv/bin/python3 -m src.replication syncprov-module | apply_config_ldif \
-        && ./venv/bin/python3 -m src.replication syncprov | apply_config_ldif \
-        && ./venv/bin/python3 -m src.replication serverid "$SERVER_ID" | apply_config_ldif \
-        && ./venv/bin/python3 -m src.replication syncrepl "$SERVER_ID" "$BASE_DN" "$ADMIN_DN" "$ADMIN_PW" "${PEERS[@]}" | apply_config_ldif \
-        && ./venv/bin/python3 -m src.replication mirrormode true | apply_config_ldif \
+    repl_step syncprov-module \
+        && repl_step syncprov \
+        && repl_step serverid "$SERVER_ID" \
+        && LDAP_ADMIN_PW="$ADMIN_PW" repl_step syncrepl "$SERVER_ID" "$BASE_DN" "$ADMIN_DN" "${PEERS[@]}" \
+        && repl_step mirrormode true \
         || { echo "❌ mirror-mode replication setup failed." >&2; exit 1; }
+}
+
+# Build one replication LDIF, then apply it. Built into a variable first:
+# piped straight into apply_config_ldif, a builder that refused its input
+# (exit 2) would hand ldapmodify empty input, which "succeeds", and the
+# chain would go on as if the step had applied.
+repl_step() {
+    local ldif
+    ldif="$(./venv/bin/python3 -m src.replication "$@")" || return 1
+    printf '%s\n' "$ldif" | apply_config_ldif
 }
 
 write_server_env() {
@@ -454,7 +497,8 @@ write_server_env() {
     if [ "${#PEERS[@]}" -gt 0 ]; then
         peers_json="$(printf '%s\n' "${PEERS[@]}" | jq -R . | jq -s -c .)"
     fi
-    cat > "$INSTALL_DIR/ldap/.env" <<EOF
+    # umask 077 so a new .env is never readable by others, even briefly.
+    (umask 077; cat > "$INSTALL_DIR/ldap/.env") <<EOF
 # LDAP SERVER config (infra-only). Read by the Entra ROPC bridge + a co-located spoke.
 LDAP_BASE_DN=$BASE_DN
 LDAP_ADMIN_DN=$ADMIN_DN
@@ -525,7 +569,8 @@ LOGROTATE
         [ -n "$EXISTING_UUID" ] && INSTALL_UUID_LINE="INSTALL_UUID=$EXISTING_UUID" \
             && echo "Preserving existing install UUID (hub fingerprint)."
     fi
-    cat <<EOF > .env
+    # umask 077 so a new .env is never readable by others, even briefly.
+    (umask 077; cat > .env) <<EOF
 HUB_URL=$HUB_URL
 SPOKE_ID=$SPOKE_ID
 SPOKE_SECRET=$SPOKE_SECRET
@@ -548,12 +593,11 @@ ${INSTALL_UUID_LINE}
 EOF
     chmod 600 .env
 
-    # Only pass --secret/--hub-secret when set (empty value aborts argparse).
-    SECRET_ARG=""
-    [ -n "$SPOKE_SECRET" ] && SECRET_ARG="--secret $SPOKE_SECRET"
-    HUB_SECRET_ARG=""
-    [ -n "${HUB_SECRET:-}" ] && HUB_SECRET_ARG="--hub-secret ${HUB_SECRET}"
-
+    # SPOKE_SECRET and HUB_SECRET reach the service only through
+    # EnvironmentFile (src.main and the base control plane read them from the
+    # environment), never as ExecStart arguments: those are world-readable in
+    # ps and the unit file, and would override a secret the hub later rotates
+    # into .env.
     echo "⚙️  Creating systemd service for auto-start..."
     cat <<EOF > /etc/systemd/system/lm-ldap.service
 [Unit]
@@ -568,7 +612,7 @@ User=root
 WorkingDirectory=$INSTALL_DIR/ldap
 EnvironmentFile=$INSTALL_DIR/ldap/.env
 Environment="PYTHONPATH=$INSTALL_DIR:$INSTALL_DIR/core/src:$INSTALL_DIR/ldap/src"
-ExecStart=$INSTALL_DIR/ldap/venv/bin/python3 -m src.main --id $SPOKE_ID --hub $HUB_URL $SECRET_ARG $HUB_SECRET_ARG
+ExecStart=$INSTALL_DIR/ldap/venv/bin/python3 -m src.main --id $SPOKE_ID --hub $HUB_URL
 StandardOutput=append:/var/log/lm/lm-ldap.log
 StandardError=append:/var/log/lm/lm-ldap.log
 Restart=always

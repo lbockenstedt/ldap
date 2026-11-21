@@ -21,7 +21,10 @@ rather than accreting stale ``rid`` entries (and the very first run works —
 # Allows modern type hints to be written as plain annotations.
 from __future__ import annotations
 
-# sys provides argv/stdout/stderr for the CLI; typing is for hints only.
+# base64 encodes non-ASCII LDIF values; os reads the CLI password from the
+# environment; sys provides argv/stdout/stderr; typing is for hints only.
+import base64
+import os
 import sys
 from typing import List, Optional
 
@@ -39,6 +42,47 @@ def _clean_peers(peers) -> List[str]:
             out.append(p)
     # Return the cleaned list.
     return out
+
+
+def _slapd_quote(value: str, field: str) -> str:
+    """Return ``value`` as a double-quoted slapd config token.
+
+    olcSyncrepl is one string that slapd splits on whitespace, honouring
+    double quotes and backslash escapes. A raw ``"`` in a password or DN would
+    end the quoted value early and let the rest be parsed as extra syncrepl
+    keywords, and a newline would end the LDIF line so the text after it
+    became a further change to cn=config, applied as root. So escape ``\\``
+    and ``"``, and refuse control characters outright."""
+    text = str(value)
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
+        raise ValueError(f"{field} must not contain control characters")
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _ldif_attr(name: str, value: str) -> str:
+    """Return one LDIF ``attr: value`` line, base64-encoded (``attr::``) when
+    the value is not a plain ASCII SAFE-STRING (RFC 2849), e.g. a password
+    with non-ASCII characters."""
+    if value.isascii() and value[:1] not in (" ", ":", "<") and not value.endswith(" "):
+        return f"{name}: {value}"
+    return f"{name}:: " + base64.b64encode(value.encode("utf-8")).decode("ascii")
+
+
+def _transport_opts(peer: str) -> str:
+    """syncrepl TLS options for one peer URL.
+
+    A plain ``ldap://`` peer gets ``starttls=critical tls_reqcert=allow``:
+    the admin bind and the replicated entries always go over TLS, and if the
+    peer can't do StartTLS replication stops rather than falling back to
+    plaintext (``yes`` would send the rootDN password in the clear). Every
+    node the installer builds has at least a self-signed cert, and the
+    installer refuses mirror mode when it could not configure one.
+    ``allow`` accepts that self-signed cert, so this stops passive capture
+    but not an active man-in-the-middle. An ``ldaps://`` peer is already TLS
+    and keeps the library defaults."""
+    if peer.lower().startswith("ldap://"):
+        return " starttls=critical tls_reqcert=allow"
+    return ""
 
 
 def build_serverid_ldif(server_id: int) -> str:
@@ -111,26 +155,33 @@ def build_syncrepl_ldif(server_id: int, peers, base_dn: str,
     # Header of the modify record that replaces all existing olcSyncrepl values.
     lines = [f"dn: {db_dn}", "changetype: modify",
              "replace: olcSyncrepl"]
+    # Quote every caller-supplied value so none can add syncrepl keywords or
+    # LDIF lines (see _slapd_quote).
+    q_base = _slapd_quote(base_dn, "base_dn")
+    q_dn = _slapd_quote(admin_dn, "admin_dn")
+    q_pw = _slapd_quote(admin_pw or "", "admin_pw")
     # Add one syncrepl consumer definition per peer.
     for idx, peer in enumerate(peers):
         # rid must be unique per node and stable per peer; keep it small (<=999,
         # slapd's rid limit). e.g. node 1 → rid 101,102...; node 2 → 201,202...
         rid = sid * 100 + idx + 1
         # Consumer settings: provider URL, live replication, retry every 30s forever,
-        # the subtree to replicate and simple-bind credentials for the peer.
+        # the subtree to replicate, TLS for a plain ldap:// peer and simple-bind
+        # credentials for the peer.
         block = (
-            f"olcSyncrepl: rid={rid:03d} "
-            f'provider="{peer}" '
+            f"rid={rid:03d} "
+            f"provider={_slapd_quote(peer, 'peer')} "
             'type=refreshAndPersist '
             'retry="30 +" '
-            'searchbase="' + base_dn + '" '
+            f"searchbase={q_base} "
             'scope=sub schemachecking=on '
-            'bindmethod=simple '
-            f'binddn="{admin_dn}" '
-            f'credentials="{admin_pw}"'
+            'bindmethod=simple'
+            f"{_transport_opts(peer)} "
+            f"binddn={q_dn} "
+            f"credentials={q_pw}"
         )
         # Append the block as another olcSyncrepl value.
-        lines.append(block)
+        lines.append(_ldif_attr("olcSyncrepl", block))
     # Join the record lines into LDIF text.
     return "\n".join(lines) + "\n"
 
@@ -170,8 +221,11 @@ def _main(argv) -> int:
       python3 -m src.replication serverid <id>
       python3 -m src.replication syncprov-module
       python3 -m src.replication syncprov [db_dn]
-      python3 -m src.replication syncrepl <id> <base_dn> <admin_dn> <admin_pw> <peer> [peer...]
+      LDAP_ADMIN_PW=... python3 -m src.replication syncrepl <id> <base_dn> <admin_dn> <peer> [peer...]
       python3 -m src.replication mirrormode <true|false> [db_dn]
+
+    The syncrepl admin password comes from the LDAP_ADMIN_PW environment
+    variable, not argv, so it never shows in ps or /proc/<pid>/cmdline.
     """
     # Without a subcommand, print the usage text (this docstring) and exit 2.
     if len(argv) < 2:
@@ -190,9 +244,13 @@ def _main(argv) -> int:
             # syncprov [db_dn]: add the overlay, optionally to a non-default database.
             sys.stdout.write(build_syncprov_overlay_ldif(*(argv[2:3] or [])))
         elif cmd == "syncrepl":
-            # syncrepl: positional id, base DN, admin DN, admin password, then peer URLs.
-            sid, base_dn, admin_dn, admin_pw = argv[2], argv[3], argv[4], argv[5]
-            peers = argv[6:]
+            # syncrepl: positional id, base DN, admin DN, then peer URLs; the
+            # password is read from the environment so it stays off argv.
+            sid, base_dn, admin_dn = argv[2], argv[3], argv[4]
+            peers = argv[5:]
+            admin_pw = os.environ.get("LDAP_ADMIN_PW", "")
+            if not admin_pw:
+                raise ValueError("LDAP_ADMIN_PW is not set in the environment")
             sys.stdout.write(build_syncrepl_ldif(int(sid), peers, base_dn, admin_dn, admin_pw))
         elif cmd == "mirrormode":
             # mirrormode <true|false> [db_dn]: accept common truthy spellings.

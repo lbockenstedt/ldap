@@ -791,6 +791,15 @@ class LdapSpoke(BaseSpoke):
                 return None
             return msg
 
+    @staticmethod
+    def _redact_credentials(text: str, password: str) -> str:
+        """Strip the replication password from an ldapmodify error: slapd can
+        echo the rejected olcSyncrepl value, which holds ``credentials=``."""
+        # The raw password first: a `"` in it would end the quoted match early.
+        if password:
+            text = text.replace(password, "***")
+        return re.sub(r'credentials=("(?:[^"\\]|\\.)*"|\S+)', "credentials=***", text)
+
     async def _apply_replication_config(self, data: Dict[str, Any]) -> str:
         """Re-apply syncrepl mirror-mode to cn=config idempotently (best-effort;
         requires co-location on the slapd host as root via ldapi EXTERNAL).
@@ -813,18 +822,19 @@ class LdapSpoke(BaseSpoke):
         # syncprov module + overlay: tolerate "exists" so re-runs are idempotent
         # (module load → "value exists", overlay add → "already exists").
         # Load the syncprov module.
+        # Errors are redacted before they go into the reply or a log.
         err = await self._ldapmodify_tolerant(
             replication.build_syncprov_module_ldif(), tolerate="exists")
         if err:
-            return f"replication syncprov module load failed: {err[:160]}"
+            return f"replication syncprov module load failed: {self._redact_credentials(err, admin_pw)[:160]}"
         # Add the syncprov overlay.
         err = await self._ldapmodify_tolerant(overlay, tolerate="already exists")
         if err:
-            return f"replication syncprov apply failed: {err[:160]}"
+            return f"replication syncprov apply failed: {self._redact_credentials(err, admin_pw)[:160]}"
         # Apply server id, syncrepl and mirror mode.
         err = await self._ldapmodify_tolerant(mirror)
         if err:
-            return f"replication mirror apply failed: {err[:160]}"
+            return f"replication mirror apply failed: {self._redact_credentials(err, admin_pw)[:160]}"
         # All steps succeeded.
         logger.info("UPDATE_CONFIG: mirror-mode replication re-applied (serverID=%s)", server_id)
         return "mirror-mode replication re-applied"
