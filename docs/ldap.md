@@ -84,7 +84,8 @@ The WebUI shows an OU as a path such as `Engineering/Lab`.
   and the `ou=users` root can't be renamed or deleted.
 - **Downstream readers must search the subtree.** Anything that reads users
   (ClearPass, applications) must search `ou=users,ou=<tenant>,…` with subtree
-  scope, or it will miss users in OUs.
+  scope, or it will miss users in OUs. They must bind with a tenant user's DN
+  or the admin DN: anonymous search returns nothing (see Directory access control).
 - **A failed move is undone, or reported.** If rewriting group members fails,
   the spoke undoes the move. If the undo also fails, the reply has
   `error: PARTIAL_ROLLBACK` and a message listing what is still changed.
@@ -158,6 +159,12 @@ certificate authority.
 - **Password generation** — `create_user` never hardcodes a password (`secrets.token_urlsafe(16)` default; returns it). The password is stored `{SSHA}`-hashed (`LdapManager._ssha`) because slapd does **not** hash a plain `add`/`modify` of `userPassword` (only the Password-Modify ext-op does) — so hashing before store avoids cleartext passwords at rest.
 - **`search`** is the cross-cutting directory query the hub uses for global search (returns `source="ldap"` records compatible with the hub's unified results).
 - **Generic python-ldap** — works against any RFC-4511 server; nothing FreeIPA-specific. Install path targets OpenLDAP `slapd`; FreeIPA/389-DS work with the same `LDAP_ADMIN_DN`/`LDAP_BASE_DN`/`LDAP_SERVER_URL`.
+- **Directory access control** — the installer replaces the data database's `olcAccess` (`ldif_template.py --acl`, applied by `configure_directory_acls` on every install run):
+  1. `userPassword` is usable only to authenticate (`by anonymous auth`). Nobody can read it, and users cannot change their own password over LDAP, which would bypass the `{SASL}` Entra pass-through.
+  2. A user under `ou=<tenant>,<base>` can read only that tenant's subtree. The legacy base-level `ou=users` and `ou=groups` each form their own scope.
+  3. Everything else is denied, including anonymous reads.
+
+  The spoke, hub, dot1x JIT provisioning and syncrepl bind as the rootDN, which ACLs do not restrict. An external reader such as a ClearPass auth source must bind with a tenant user's DN (or the admin DN); anonymous search no longer returns anything. An existing server gets these ACLs only when the installer is re-run. If the ACLs can't be applied, the install fails. A new server (slapd was not installed before the run, including one removed but not purged) listens only on its local `ldapi:///` socket until the ACLs are applied: the installer creates `/etc/ldap/.lm-acls-pending`, keeps apt from starting slapd with a `/usr/sbin/policy-rc.d` hook that denies only slapd (an existing `policy-rc.d` that the installer did not write is left alone, with a warning), sets `SLAPD_SERVICES="ldapi:///"` in `/etc/default/slapd` right after installing slapd (or when apt fails), and restores `ldap:///` (and `ldaps:///` with the TLS step) only once the ACLs succeed. This holds if the installer fails at any step, is killed, or the host reboots; re-run the installer to finish. An existing server keeps running on its previous ACLs, because stopping it would take every tenant's logins down.
 - **DN/filter injection guards** — DN RDN components are escaped via `ldap.dn.escape_dn_chars` (`_escape_rdn`) and search input is RFC-4515 escaped (`\` → `\5c`, `*` → `\2a`, `(` → `\28`, `)` → `\29`). The spoke binds as admin, so this is security-critical.
 
 ## How it works

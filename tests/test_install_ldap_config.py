@@ -143,3 +143,145 @@ def test_provision_server_makes_its_temp_files_through_new_tmpfile():
                      if not l.strip().startswith("#"))
     assert "$(mktemp" not in body and "trap " not in body
     assert "new_tmpfile PWFILE" in body and "new_tmpfile TMPLDIF" in body
+
+
+def _acl_sandbox(tmp_path, ldapmodify_rc=0):
+    """A cwd with ./venv/bin/python3 and src/ like the installed repo, and a
+    stub ldapmodify that saves its stdin to applied.ldif."""
+    import sys
+    (tmp_path / "venv" / "bin").mkdir(parents=True)
+    (tmp_path / "venv" / "bin" / "python3").symlink_to(sys.executable)
+    (tmp_path / "src").symlink_to(os.path.join(ROOT, "src"))
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    stub = bin_dir / "ldapmodify"
+    stub.write_text(f"#!/bin/sh\ncat > {tmp_path}/applied.ldif\nexit {ldapmodify_rc}\n")
+    stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+    return {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+
+
+def _run_acls(tmp_path, base_dn, rc=0):
+    env = _acl_sandbox(tmp_path, rc)
+    script = ("set -e\n" + _function("apply_config_ldif") + _function("configure_directory_acls")
+              + f'\nBASE_DN="{base_dn}"\nconfigure_directory_acls\n')
+    return subprocess.run(["bash", "-c", script], env=env, cwd=tmp_path,
+                          capture_output=True, text=True)
+
+
+def test_installer_applies_tenant_scoped_acls(tmp_path):
+    res = _run_acls(tmp_path, "dc=lab,dc=example")
+    assert res.returncode == 0, res.stderr
+    ldif = (tmp_path / "applied.ldif").read_text()
+    assert "replace: olcAccess" in ldif
+    assert "by * read" not in ldif and "self write" not in ldif
+
+
+def test_installer_acl_failures_are_fatal(tmp_path):
+    # A base DN the renderer refuses: nothing is applied.
+    res = _run_acls(tmp_path, "o=Acme Inc")
+    assert res.returncode != 0 and not (tmp_path / "applied.ldif").exists()
+    # ldapmodify refusing the change is an error too.
+    res = _run_acls(tmp_path / "x" if (tmp_path / "x").mkdir() is None else tmp_path, "dc=a", rc=80)
+    assert res.returncode != 0 and "directory ACLs failed" in res.stderr
+
+
+def test_provision_server_applies_acls_before_tls():
+    body = _function("provision_server")
+    acl = body.index("open_directory_after_acls || exit 1")
+    apt = body.index("apt-get install -y \\\n        slapd")
+    assert body.index('touch "$ACLS_PENDING"') < body.index("hold_slapd_start ||") < apt
+    assert apt < body.index('set_slapd_services "ldapi:///" || true') < body.index("release_slapd_start ||")
+    assert body.index("release_slapd_start ||") < body.index("restrict_slapd_to_ldapi || exit 1")
+    assert body.index("restrict_slapd_to_ldapi || exit 1") < body.index("systemctl enable slapd")
+    assert body.index("ldif_template \"$BASE_DN\" base_structure.ldif") < acl
+    assert acl < body.index("configure_self_signed_tls")
+
+
+def _run_pending(tmp_path, call, ldapmodify_rc=0, systemctl_rc=0, pending=True):
+    """Run CALL with stub ldapmodify/systemctl (systemctl logs its args) and
+    a sandboxed $SLAPD_DEFAULTS / $ACLS_PENDING."""
+    env = _acl_sandbox(tmp_path, ldapmodify_rc)
+    ctl = tmp_path / "bin" / "systemctl"
+    ctl.write_text(f"#!/bin/sh\necho \"$@\" >> {tmp_path}/systemctl.log\nexit {systemctl_rc}\n")
+    ctl.chmod(ctl.stat().st_mode | stat.S_IEXEC)
+    defaults, marker = tmp_path / "slapd.default", tmp_path / "pending"
+    defaults.write_text('SLAPD_CONF=\nSLAPD_SERVICES="ldap:/// ldapi:///"\nSLAPD_OPTIONS=""\n')
+    if pending:
+        marker.touch()
+    script = ("set -e\n" + "".join(_function(f) for f in (
+                  "apply_config_ldif", "configure_directory_acls", "set_slapd_services",
+                  "restrict_slapd_to_ldapi", "open_directory_after_acls"))
+              + f"\nBASE_DN=dc=a SLAPD_DEFAULTS={defaults} ACLS_PENDING={marker}\n{call} || exit 7\n")
+    res = subprocess.run(["bash", "-c", script], cwd=tmp_path, env=env,
+                         capture_output=True, text=True)
+    log = tmp_path / "systemctl.log"
+    return res, (log.read_text() if log.exists() else ""), defaults.read_text(), marker.exists()
+
+
+def test_pending_server_is_restricted_to_ldapi(tmp_path):
+    res, ctl, conf, _ = _run_pending(tmp_path, "restrict_slapd_to_ldapi")
+    assert res.returncode == 0, res.stderr
+    assert 'SLAPD_SERVICES="ldapi:///"' in conf and "ldap:/// " not in conf
+    assert "SLAPD_CONF=" in conf and 'SLAPD_OPTIONS=""' in conf
+    assert ctl == "restart slapd\n"
+
+
+def test_failed_ldapi_restart_stops_slapd(tmp_path):
+    res, ctl, _, _ = _run_pending(tmp_path, "restrict_slapd_to_ldapi", systemctl_rc=1)
+    assert res.returncode == 7
+    assert "stop slapd" in ctl and "not listening on the network" in res.stderr
+
+
+def test_failed_acls_keep_a_pending_server_off_the_network(tmp_path):
+    (tmp_path / "slapd.default").touch()
+    res, ctl, conf, pending = _run_pending(tmp_path, "restrict_slapd_to_ldapi && open_directory_after_acls",
+                                           ldapmodify_rc=80)
+    assert res.returncode == 7 and "stays on ldapi:/// only" in res.stderr
+    assert pending and 'SLAPD_SERVICES="ldapi:///"' in conf
+
+
+def test_acls_restore_a_pending_servers_listeners(tmp_path):
+    res, _, conf, pending = _run_pending(tmp_path, "restrict_slapd_to_ldapi && open_directory_after_acls")
+    assert res.returncode == 0, res.stderr
+    assert not pending and 'SLAPD_SERVICES="ldap:/// ldapi:///"' in conf
+
+
+def test_failed_acls_keep_an_existing_server_running(tmp_path):
+    res, ctl, conf, pending = _run_pending(tmp_path, "open_directory_after_acls",
+                                           ldapmodify_rc=80, pending=False)
+    assert res.returncode == 7 and "previous ACLs" in res.stderr
+    assert ctl == "" and 'SLAPD_SERVICES="ldap:/// ldapi:///"' in conf and not pending
+
+
+def test_acls_leave_an_existing_servers_listeners_alone(tmp_path):
+    res, ctl, conf, _ = _run_pending(tmp_path, "open_directory_after_acls", pending=False)
+    assert res.returncode == 0, res.stderr
+    assert ctl == "" and conf.count("SLAPD_SERVICES") == 1 and conf.startswith("SLAPD_CONF=")
+
+
+def _run_hold(tmp_path, call, existing=None):
+    """Run CALL with hold_slapd_start/release_slapd_start on a sandboxed
+    $POLICY_RC_D; returns (result, policy path)."""
+    policy = tmp_path / "policy-rc.d"
+    if existing is not None:
+        policy.write_text(existing)
+    script = (_function("hold_slapd_start") + _function("release_slapd_start")
+              + f"\nPOLICY_RC_D={policy}\n{call}\n")
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True), policy
+
+
+def test_hold_denies_only_slapd_starts(tmp_path):
+    res, policy = _run_hold(tmp_path, "hold_slapd_start")
+    assert res.returncode == 0, res.stderr
+    assert subprocess.run([str(policy), "slapd", "start"]).returncode == 101
+    assert subprocess.run([str(policy), "slapd.service", "start"]).returncode == 101
+    assert subprocess.run([str(policy), "nginx", "start"]).returncode == 0
+
+
+def test_release_removes_only_our_hold(tmp_path):
+    res, policy = _run_hold(tmp_path, "hold_slapd_start && release_slapd_start")
+    assert res.returncode == 0 and not policy.exists()
+    foreign = "#!/bin/sh\nexit 101\n"
+    res, policy = _run_hold(tmp_path, "hold_slapd_start && release_slapd_start", existing=foreign)
+    assert res.returncode == 0 and policy.read_text() == foreign
+    assert "not adding the slapd start hold" in res.stderr
