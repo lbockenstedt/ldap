@@ -151,6 +151,11 @@ class LdapManager:
         (it's not an ``LDAPError``), so a bind failure surfaces as a clean
         ``INVALID_CREDENTIALS`` envelope at the spoke, not a cryptic per-method
         log line or a control-plane traceback."""
+        # An empty password would be an unauthenticated (anonymous) bind, not
+        # the admin: refuse it with the same actionable error.
+        if not self.admin_pw:
+            raise LdapBindError("LDAP bind refused: LDAP_ADMIN_PW is not set — set the "
+                                "admin password via Setup → LDAP (UPDATE_CONFIG).")
         # Simple bind with the admin DN and password.
         try:
             conn.simple_bind_s(self.admin_dn, self.admin_pw)
