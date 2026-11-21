@@ -100,6 +100,10 @@ class LdapSpoke(BaseSpoke):
         # .env, the PEM files and cn=config, so two interleaved pushes could
         # restore each other's half-applied state.
         self._update_config_lock = asyncio.Lock()
+        # INSTALL_CERT runs snapshot -> apply -> rollback as one transaction.
+        # The control plane runs commands concurrently, so without this lock
+        # a failing install could roll back over one that already succeeded.
+        self._cert_lock = asyncio.Lock()
 
     # Refresh floor for the OU list, in seconds (fleet-rules 4.8: minutes).
     _OU_CACHE_TTL = 300
@@ -600,39 +604,237 @@ class LdapSpoke(BaseSpoke):
         leaf, cas = self._split_chain(fullchain)
         ca_blocks = cas + ([ca_pem.strip()] if ca_pem and ca_pem.strip() else [])
         ca_path = cfg.get("LDAP_TLS_CA", f"{cert_dir}/slapd-ca.pem") if ca_blocks else None
+        paths = [p for p in (cert_path, key_path, ca_path) if p]
+        changed = list(self._TLS_ATTRS[:2]) + ([self._TLS_ATTRS[2]] if ca_path else [])
 
-        # Write the files; any failure becomes an ERROR result.
+        async def _serialised() -> Dict[str, Any]:
+            """Steps 1-3 under the cert lock, so one install's snapshot and
+            rollback never interleave with another's writes."""
+            async with self._cert_lock:
+                # Step 1: record the live files and olcTLS* paths, so any
+                # failure below can put them back. slapd re-reads these files
+                # on its next restart: a half-installed or mismatched cert/key
+                # left in place would stop LDAPS (or slapd) then, long after
+                # this command.
+                try:
+                    old_attrs = await self._read_tls_attrs()
+                    snapshot = await asyncio.to_thread(self._snapshot_files, paths)
+                except Exception as e:  # noqa: BLE001
+                    return {"status": "ERROR",
+                            "message": f"could not read the current TLS config, nothing changed: {str(e)[:300]}"}
+                # Steps 2-3: write, modify, restart; roll back on failure.
+                return await self._apply_cert(
+                    cert_dir, cert_path, leaf, ca_path, "".join(ca_blocks), key_path, privkey,
+                    slapd_user, do_restart, snapshot, old_attrs, changed)
+
+        # The transaction runs as its own task, shielded: cancelling this
+        # command (e.g. the spoke shutting down) must not stop a half-made
+        # change between its steps. It still finishes or rolls back, then the
+        # cancellation goes on.
+        work = asyncio.ensure_future(_serialised())
         try:
-            os.makedirs(cert_dir, exist_ok=True)
-            self._write_pem(cert_path, leaf, 0o644)
-            if ca_path:
-                self._write_pem(ca_path, "".join(ca_blocks), 0o644)
-            self._write_pem(key_path, privkey, 0o600)
-            # Key must be readable by the slapd user or slapd errors with the
-            # opaque "implementation specific error (80)". Best-effort: a
-            # missing/non-standard user logs a warning and proceeds (ldapmodify
-            # will then surface the read failure as error 80).
+            return await asyncio.shield(work)
+        except asyncio.CancelledError:
+            while not work.done():
+                try:
+                    await asyncio.shield(work)
+                except asyncio.CancelledError:
+                    pass
+            raise
+
+    async def _apply_cert(self, cert_dir: str, cert_path: str, leaf: str,
+                          ca_path: Optional[str], ca_pem: str, key_path: str, privkey: str,
+                          slapd_user: str, do_restart: bool, snapshot: Dict[str, Any],
+                          old_attrs: Dict[str, str], changed: List[str]) -> Dict[str, Any]:
+        """install_cert steps 2-3: write the files, point cn=config at them
+        and restart slapd; on any failure (a cancellation too) roll back to
+        the snapshot. A cancellation is re-raised after the rollback."""
+        # Step 2. attrs_touched: the modify may have applied (a clean
+        # ldapmodify failure means slapd refused it whole; a timeout or a
+        # cancellation is unknown). The file write is shielded: a cancelled
+        # to_thread keeps writing, so the rollback waits for it first.
+        attrs_touched = restarted = False
+        write = asyncio.ensure_future(asyncio.to_thread(
+            self._write_tls_files, cert_dir, cert_path, leaf, ca_path, ca_pem,
+            key_path, privkey, slapd_user))
+        try:
+            await asyncio.shield(write)
+            attrs_touched = True
             try:
-                shutil.chown(key_path, user=slapd_user)
-            except (LookupError, PermissionError, OSError) as e:
-                logger.warning("INSTALL_CERT: could not chown key to '%s' (%s); "
-                               "slapd may fail to read it (error 80)", slapd_user, e)
-
-            # Point slapd at the files, then restart so it loads them.
-            ldif = self._build_tls_ldif(cert_path, key_path, ca_path)
-            await self._ldapmodify(ldif)
-
+                await self._ldapmodify(self._build_tls_ldif(cert_path, key_path, ca_path))
+            except _CertInstallError:
+                attrs_touched = False
+                raise
             if do_restart:
+                restarted = True
                 await self._restart_slapd()
-            logger.info("INSTALL_CERT: slapd TLS cert installed (cert=%s)", cert_path)
-            return {"status": "SUCCESS",
-                    "message": f"slapd TLS cert installed ({cert_path})"}
-        # Known install step failure: report its message.
-        except _CertInstallError as e:
-            return {"status": "ERROR", "message": str(e)}
-        # Unexpected failure: report a shortened message.
+        # Step 3: on any failure, put the previous certificate back.
+        except BaseException as e:  # noqa: BLE001
+            if not write.done():
+                await asyncio.wait({write})
+            msg = str(e) if isinstance(e, _CertInstallError) else f"install_cert failed: {str(e)[:300] or type(e).__name__}"
+            result = await self._rollback_cert(snapshot, old_attrs, changed, attrs_touched, restarted, msg)
+            if not isinstance(e, Exception):
+                raise
+            return result
+        logger.info("INSTALL_CERT: slapd TLS cert installed (cert=%s)", cert_path)
+        return {"status": "SUCCESS", "message": f"slapd TLS cert installed ({cert_path})"}
+
+    # The cn=config attributes INSTALL_CERT sets: cert, key, then CA bundle.
+    _TLS_ATTRS = ("olcTLSCertificateFile", "olcTLSCertificateKeyFile", "olcTLSCACertificateFile")
+
+    def _write_tls_files(self, cert_dir: str, cert_path: str, leaf: str,
+                         ca_path: Optional[str], ca_pem: str, key_path: str,
+                         privkey: str, slapd_user: str) -> None:
+        """Write the leaf (0644), CA bundle (0644, when there is one) and key
+        (0600, chowned to the slapd user). Blocking; run via to_thread."""
+        os.makedirs(cert_dir, exist_ok=True)
+        self._write_pem(cert_path, leaf, 0o644)
+        if ca_path:
+            self._write_pem(ca_path, ca_pem, 0o644)
+        self._write_pem(key_path, privkey, 0o600)
+        # Key must be readable by the slapd user or slapd errors with the
+        # opaque "implementation specific error (80)". Best-effort: a
+        # missing/non-standard user logs a warning and proceeds (ldapmodify
+        # will then surface the read failure as error 80).
+        try:
+            shutil.chown(key_path, user=slapd_user)
+        except (LookupError, PermissionError, OSError) as e:
+            logger.warning("INSTALL_CERT: could not chown key to '%s' (%s); "
+                           "slapd may fail to read it (error 80)", slapd_user, e)
+
+    async def _read_tls_attrs(self) -> Dict[str, str]:
+        """The olcTLS* file paths cn=config holds now (an unset one is absent).
+        Raises _CertInstallError when slapd can't be asked."""
+        proc = await asyncio.create_subprocess_exec(
+            "ldapsearch", "-LLL", "-Q", "-Y", "EXTERNAL", "-H", "ldapi:///",
+            # ldapsearch reads the first operand as the filter, the rest as
+            # the attributes to return.
+            "-b", "cn=config", "-s", "base", "(objectClass=*)", *self._TLS_ATTRS,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        stdout, stderr = await self._communicate(proc, None, 30)
+        if proc.returncode != 0:
+            err = stderr.decode().strip() or f"ldapsearch exited {proc.returncode}"
+            raise _CertInstallError(f"ldapsearch failed: {err[:300]}")
+        # Unfold continuation lines (RFC 2849), then read "attr: v" and
+        # base64 "attr:: v" values.
+        text = re.sub(r"\r?\n ", "", stdout.decode("utf-8", errors="replace"))
+        names = {a.lower(): a for a in self._TLS_ATTRS}
+        found = {}
+        for line in text.splitlines():
+            name, sep, value = line.partition(":")
+            if sep and name.lower() in names:
+                found[names[name.lower()]] = (
+                    base64.b64decode(value[1:].strip()).decode("utf-8") if value.startswith(":")
+                    else value.strip())
+        return found
+
+    @classmethod
+    def _restore_tls_ldif(cls, old: Dict[str, str], changed: List[str]) -> str:
+        """LDIF that sets each changed olcTLS* attribute back to ``old``.
+        Values are base64 so any path round-trips; a ``replace`` with no
+        value removes an attribute that was unset before (and is a no-op
+        when it is still unset)."""
+        lines = ["dn: cn=config", "changetype: modify"]
+        for attr in changed:
+            lines.append(f"replace: {attr}")
+            if attr in old:
+                lines.append(f"{attr}:: {base64.b64encode(old[attr].encode()).decode()}")
+            lines.append("-")
+        return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _snapshot_files(paths: List[str]) -> Dict[str, Any]:
+        """Record each path as it is now: ("link", target) for a symlink,
+        ("file", bytes, mode, uid, gid) for a file, None when absent."""
+        snap: Dict[str, Any] = {}
+        for p in paths:
+            if os.path.islink(p):
+                snap[p] = ("link", os.readlink(p))
+            elif os.path.exists(p):
+                st = os.stat(p)
+                with open(p, "rb") as f:
+                    snap[p] = ("file", f.read(), st.st_mode & 0o777, st.st_uid, st.st_gid)
+            else:
+                snap[p] = None
+        return snap
+
+    @staticmethod
+    def _restore_files(snap: Dict[str, Any]) -> None:
+        """Put every path back as ``_snapshot_files`` recorded it: content,
+        mode and owner, or the symlink, or remove a file that was absent.
+        Each one is swapped in atomically. Raises OSError on a failure."""
+        for path, old in snap.items():
+            tmp = f"{path}.tmp"
+            if old is None:
+                if os.path.lexists(path):
+                    os.unlink(path)
+                continue
+            if os.path.lexists(tmp):
+                os.unlink(tmp)
+            if old[0] == "link":
+                os.symlink(old[1], tmp)
+            else:
+                _, data, mode, uid, gid = old
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+                with os.fdopen(fd, "wb") as f:
+                    f.write(data)
+                os.chmod(tmp, mode)
+                os.chown(tmp, uid, gid)
+            os.replace(tmp, path)
+
+    async def _rollback_cert(self, snap: Dict[str, Any], old_attrs: Dict[str, str],
+                             changed: List[str], attrs_touched: bool, restarted: bool,
+                             msg: str) -> Dict[str, Any]:
+        """Undo a failed INSTALL_CERT so slapd runs on the previous certificate.
+        An undo step that fails is reported as PARTIAL_ROLLBACK.
+
+        Order matters. A failed restart usually leaves slapd stopped, and the
+        cn=config undo goes through slapd's ldapi socket, so slapd is started
+        again first, on the restored files. Files this install created stay
+        until cn=config no longer names them: removing them earlier would stop
+        slapd starting at all. A final restart applies the old TLS paths
+        (see _restart_slapd)."""
+        undo_errors = []
+        existing = {p: v for p, v in snap.items() if v is not None}
+        created = {p: None for p, v in snap.items() if v is None}
+        # 1. Put back the files that were there before.
+        try:
+            await asyncio.to_thread(self._restore_files, existing)
         except Exception as e:  # noqa: BLE001
-            return {"status": "ERROR", "message": f"install_cert failed: {str(e)[:300]}"}
+            undo_errors.append(f"restoring the files failed: {str(e)[:150]}")
+        # 2. A restart was attempted, so slapd may be down: start it again.
+        if restarted:
+            try:
+                await self._restart_slapd()
+            except Exception as e:  # noqa: BLE001
+                undo_errors.append(f"restarting slapd failed: {str(e)[:150]}")
+        # 3. Point cn=config back at the previous paths, if the modify may have applied.
+        config_restored = True
+        if attrs_touched:
+            try:
+                await self._ldapmodify(self._restore_tls_ldif(old_attrs, changed))
+            except Exception as e:  # noqa: BLE001
+                config_restored = False
+                undo_errors.append(f"restoring cn=config failed: {str(e)[:150]}")
+        # 4. Remove the files this install created, once nothing names them.
+        if created and config_restored:
+            try:
+                await asyncio.to_thread(self._restore_files, created)
+            except Exception as e:  # noqa: BLE001
+                undo_errors.append(f"removing the new files failed: {str(e)[:150]}")
+        # 5. Restart once more so the old TLS paths take effect.
+        if restarted and attrs_touched and config_restored:
+            try:
+                await self._restart_slapd()
+            except Exception as e:  # noqa: BLE001
+                undo_errors.append(f"restarting slapd failed: {str(e)[:150]}")
+        if undo_errors:
+            logger.error("INSTALL_CERT: rollback incomplete: %s", "; ".join(undo_errors))
+            return {"status": "ERROR", "error": "PARTIAL_ROLLBACK",
+                    "message": f"{msg}; rollback incomplete: {'; '.join(undo_errors)}"}
+        logger.warning("INSTALL_CERT failed, previous certificate restored: %s", msg)
+        return {"status": "ERROR", "message": f"{msg}; previous certificate restored"}
 
     @staticmethod
     def _write_pem(path: str, content: str, mode: int) -> None:
@@ -660,8 +862,9 @@ class LdapSpoke(BaseSpoke):
         """Run an OpenLDAP client tool (ldapmodify/ldapsearch) as root over
         ldapi:/// with SASL EXTERNAL (root peer-cred → cn=config access) and
         return its stdout. Raises _CertInstallError on a missing tool, a
-        non-zero exit or a 30 s timeout; on timeout the process is killed and
-        reaped so it can't finish its write after we reported a failure."""
+        non-zero exit or a 30 s timeout; on timeout or cancellation the process
+        is killed and reaped so it can't finish its write after we reported a
+        failure."""
         # Start the tool with root's EXTERNAL identity over the local socket.
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -672,15 +875,11 @@ class LdapSpoke(BaseSpoke):
             )
         except OSError as e:
             raise _CertInstallError(f"{tool} could not start: {e}") from e
-        # Feed stdin, waiting up to 30 seconds; kill and reap on timeout.
+        # Feed stdin, waiting up to 30 seconds; the child is killed and
+        # reaped on timeout or cancellation (_communicate).
         try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(input=stdin), timeout=30)
+            stdout, stderr = await self._communicate(proc, stdin, 30)
         except asyncio.TimeoutError:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass  # it exited just as the timer fired
-            await proc.wait()
             raise _CertInstallError(f"{tool} timed out after 30s") from None
         # Non-zero exit: raise with stderr, stdout or the exit code.
         if proc.returncode != 0:
@@ -695,6 +894,24 @@ class LdapSpoke(BaseSpoke):
         replication LDIF carries the admin password."""
         await self._run_ldapi("ldapmodify", [], ldif.encode())
 
+    @staticmethod
+    async def _communicate(proc, data: Optional[bytes], timeout: float):
+        """proc.communicate() with a timeout that kills and reaps the child.
+        wait_for alone only cancels the wait: a timed-out ldapmodify left
+        running could apply its change after the rollback undid it. A killed
+        systemctl's job stays queued in systemd, ahead of any later restart."""
+        try:
+            return await asyncio.wait_for(proc.communicate(input=data), timeout=timeout)
+        except BaseException:
+            # Timeout or cancellation: the child must not outlive this call.
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                await proc.wait()
+            raise
+
     async def _restart_slapd(self) -> None:
         """Restart slapd so the new TLS context takes effect (OpenLDAP ITS#6135:
         global TLS settings via cn=config only reliably apply on restart)."""
@@ -705,7 +922,7 @@ class LdapSpoke(BaseSpoke):
             stderr=asyncio.subprocess.PIPE,
         )
         # Wait up to 45 seconds.
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=45)
+        _, stderr = await self._communicate(proc, None, 45)
         # Non-zero exit: raise with stderr or the exit code.
         if proc.returncode != 0:
             err = stderr.decode().strip() or f"systemctl exited {proc.returncode}"
