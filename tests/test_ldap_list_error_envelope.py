@@ -15,6 +15,7 @@ list methods to raise.
 """
 import asyncio
 import importlib.util
+import re
 import sys
 import time
 import types
@@ -233,11 +234,12 @@ def test_partial_rollback_invalidates_the_cache():
     assert len(calls) == 2
 
 
-def test_update_config_clears_the_cache():
+def test_update_config_clears_the_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("LDAP_ENV_PATH", str(tmp_path / ".env"))
     sp = _spoke()
     calls = []
     _prime(sp, calls)
-    _run(sp.handle_command("UPDATE_CONFIG", {"LDAP_BASE_DN": "dc=x,dc=y"}))
+    _run(sp.handle_command("UPDATE_CONFIG", {"LDAP_BASE_DN": "dc=x,dc=y", "LDAP_ADMIN_PW": "pw"}))
     sp.manager.list_ous_scoped = lambda slug: (calls.append(slug),
                                                {"status": "SUCCESS", "ous": []})[1]
     _run(sp.handle_command("LDAP_LIST_OUS", {"tenant_slug": "lrb"}))
@@ -485,8 +487,327 @@ def test_replication_errors_never_carry_the_admin_password():
     async def _echo(ldif, tolerate=""):
         return f'ldapmodify failed: olcSyncrepl: bad credentials="{pw}" rid=001 ({pw})'
     sp._ldapmodify_tolerant = _echo
-    note = asyncio.run(sp._apply_replication_config({
-        "LDAP_SERVER_ID": "1", "LDAP_MIRROR_PEERS": '["ldap://peer:389"]',
-        "LDAP_BASE_DN": "dc=x", "LDAP_ADMIN_DN": "cn=admin,dc=x", "LDAP_ADMIN_PW": pw}))
-    assert "failed" in note and "credentials=***" in note
+    ok, note = asyncio.run(sp._apply_replication_config({
+        "LDAP_BASE_DN": "dc=x", "LDAP_ADMIN_DN": "cn=admin,dc=x", "LDAP_ADMIN_PW": pw},
+        1, ["ldap://peer:389"]))
+    assert not ok and "failed" in note and "credentials=***" in note
     assert "w0rd" not in note
+
+
+# ── UPDATE_CONFIG: the hub's payload contract (lm main.py _ldap_config_for_spoke) ──
+
+_PEM_KEY = "-----BEGIN PRIVATE KEY-----\nAAA=\nBBB==\n-----END PRIVATE KEY-----"
+_PEM_CERT = "-----BEGIN CERTIFICATE-----\nCCC\n-----END CERTIFICATE-----"
+
+
+def _hub_push(**extra):
+    """A payload shaped like the hub's push for a single node."""
+    cfg = {"LDAP_SERVER_URL": "ldap://localhost:389", "LDAP_BASE_DN": "dc=x,dc=y",
+           "LDAP_ADMIN_DN": "cn=admin,dc=x,dc=y", "LDAP_ADMIN_PW": "pw",
+           "LDAP_SERVER_ID": "inst-7f3a", "LDAP_MIRROR_PEERS": "[]",
+           "ENTRA_TENANT_ID": "t", "ENTRA_CLIENT_ID": "c",
+           "ENTRA_CLIENT_CERT": _PEM_CERT, "ENTRA_CLIENT_KEY": _PEM_KEY,
+           "ENTRA_ROPC_SCOPE": "openid"}
+    cfg.update(extra)
+    return cfg
+
+
+def _load_ropc():
+    spec = importlib.util.spec_from_file_location("entra_ropc_auth_t", _PXMX_ROOT / "src" / "entra_ropc_auth.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_update_config_stores_pushed_entra_pems_as_files(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    monkeypatch.setenv("LDAP_ENV_PATH", str(env))
+    for k in ("ENTRA_CLIENT_CERT", "ENTRA_CLIENT_KEY"):
+        monkeypatch.delenv(k, raising=False)
+    # An older spoke left a multi-line PEM in .env; it is dropped on rewrite.
+    env.write_text("KEEP=1\nENTRA_CLIENT_KEY=" + _PEM_KEY + "\nOTHER=2\n")
+    sp = _spoke()
+    res = _run(sp.handle_command("UPDATE_CONFIG", _hub_push()))
+    assert res["status"] == "SUCCESS", res
+    text = env.read_text()
+    assert "BEGIN" not in text and "AAA=" not in text
+    assert "KEEP=1" in text and "OTHER=2" in text
+    cfg = _load_ropc().load_config(str(env))
+    key_path, cert_path = Path(cfg["key_path"]), Path(cfg["cert_path"])
+    assert key_path.read_text().strip() == _PEM_KEY
+    assert cert_path.read_text().strip() == _PEM_CERT
+    assert oct(key_path.stat().st_mode & 0o777) == "0o600"
+    # A blank cert/key from the hub keeps the stored paths.
+    res = _run(sp.handle_command("UPDATE_CONFIG", _hub_push(ENTRA_CLIENT_CERT="", ENTRA_CLIENT_KEY="")))
+    assert res["status"] == "SUCCESS"
+    assert _load_ropc().load_config(str(env))["key_path"] == str(key_path)
+
+
+def test_update_config_applies_hub_mirror_peer_dicts(tmp_path, monkeypatch):
+    monkeypatch.setenv("LDAP_ENV_PATH", str(tmp_path / ".env"))
+    sp = _spoke()
+    applied = []
+
+    async def _modify(ldif):
+        applied.append(ldif)
+    sp._ldapmodify = _modify
+
+    async def _ids():
+        return []
+    sp._read_server_ids = _ids
+    peers = '[{"server_id": "2", "url": "ldap://peer2:389"}]'
+    res = _run(sp.handle_command("UPDATE_CONFIG", _hub_push(LDAP_SERVER_ID="1", LDAP_MIRROR_PEERS=peers)))
+    assert res["status"] == "SUCCESS", res
+    assert any('provider="ldap://peer2:389"' in l for l in applied)
+    # A single node ("[]" peers, non-numeric instance id) touches no replication.
+    applied.clear()
+    res = _run(sp.handle_command("UPDATE_CONFIG", _hub_push()))
+    assert res["status"] == "SUCCESS" and applied == []
+
+
+def test_update_config_rejects_bad_input_without_changing_anything(tmp_path, monkeypatch):
+    monkeypatch.setenv("LDAP_ENV_PATH", str(tmp_path / ".env"))
+    sp = LdapSpoke("ldap-1", {"LDAP_ADMIN_PW": "old", "LDAP_TLS_CERT": "/etc/ldap/tls/c.pem"})
+    before = sp.manager
+    # No admin password anywhere: refused rather than defaulted.
+    sp2 = _spoke()
+    res = _run(sp2.handle_command("UPDATE_CONFIG", {"LDAP_BASE_DN": "dc=x,dc=y"}))
+    assert res["status"] == "ERROR" and "LDAP_ADMIN_PW" in res["message"]
+    assert sp.manager is before and not (tmp_path / ".env").exists()
+    # A valid push merges: keys the hub doesn't send (LDAP_TLS_*) survive,
+    # and a None admin password keeps the current one.
+    res = _run(sp.handle_command("UPDATE_CONFIG", _hub_push(LDAP_ADMIN_PW=None)))
+    assert res["status"] == "SUCCESS"
+    assert sp.config["LDAP_TLS_CERT"] == "/etc/ldap/tls/c.pem"
+    assert sp.manager.admin_pw == "old"
+
+
+def test_multi_instance_hub_push_applies_connection_and_skips_replication(tmp_path, monkeypatch):
+    """With 2+ ldap_instances and no Setup server_id the hub sends the
+    instance UUID as LDAP_SERVER_ID plus peers derived from the other
+    instances. The connection settings must still apply (PARTIAL), with
+    replication left untouched."""
+    env = tmp_path / ".env"
+    monkeypatch.setenv("LDAP_ENV_PATH", str(env))
+    sp = LdapSpoke("ldap-1", {"LDAP_ADMIN_PW": "old"})
+    applied = []
+
+    async def _modify(ldif):
+        applied.append(ldif)
+    sp._ldapmodify = _modify
+    for peers in ('[{"server_id": "9b1c2d3e-0000-4000-8000-000000000002", "url": "ldap://p:389"}]',
+                  '[not json'):
+        res = _run(sp.handle_command("UPDATE_CONFIG", _hub_push(
+            LDAP_SERVER_ID="7f3a9c4e-0000-4000-8000-000000000001", LDAP_MIRROR_PEERS=peers,
+            LDAP_ADMIN_PW="new-pw", LDAP_BASE_DN="dc=new,dc=y")))
+        assert res["status"] == "PARTIAL", res
+        assert "replication not applied" in res["message"]
+        assert sp.manager.admin_pw == "new-pw" and sp.manager.base_dn == "dc=new,dc=y"
+        assert "ENTRA_CLIENT_KEY=" in env.read_text()
+        assert applied == []
+
+
+def test_cleanup_only_deletes_files_the_spoke_named(tmp_path, monkeypatch):
+    """Superseded PEMs are removed only when they carry the spoke's own
+    randomised name; installer or operator files beside .env survive."""
+    monkeypatch.setenv("LDAP_ENV_PATH", str(tmp_path / ".env"))
+    sp = _spoke()
+    names = ["entra-client.crt", "entra-client-prod.key", "entra-client.0123456789ab.crt.bak",
+             "entra-client.0123456789ab.key"]
+    for n in names:
+        (tmp_path / n).write_text("x")
+    sp._remove_spoke_pems([str(tmp_path / n) for n in names])
+    left = sorted(p.name for p in tmp_path.iterdir())
+    assert left == sorted(names[:3])
+
+
+def test_update_config_reports_a_failed_step_as_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("LDAP_ENV_PATH", str(tmp_path / ".env"))
+    sp = _spoke()
+
+    async def _fail(ldif):
+        raise spoke_mod._CertInstallError("ldapmodify: Insufficient access")
+    sp._ldapmodify = _fail
+    res = _run(sp.handle_command("UPDATE_CONFIG", _hub_push(
+        LDAP_SERVER_ID="1", LDAP_MIRROR_PEERS='["ldap://p:389"]')))
+    assert res["status"] == "ERROR" and "replication" in res["message"]
+    # .env persist failure is an ERROR too, not a SUCCESS with a note.
+    def _boom(data):
+        raise OSError("read-only file system")
+    sp._persist_env = _boom
+    res = _run(sp.handle_command("UPDATE_CONFIG", _hub_push()))
+    assert res["status"] == "ERROR" and "env persist failed" in res["message"]
+
+
+def _snapshot(tmp_path, sp):
+    """Everything a failed UPDATE_CONFIG must leave alone."""
+    files = {p.name: p.read_bytes() for p in sorted(tmp_path.iterdir())}
+    return sp.manager, dict(sp.config), files
+
+
+def test_failed_replication_leaves_runtime_env_and_pems_unchanged(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    monkeypatch.setenv("LDAP_ENV_PATH", str(env))
+    sp = _spoke()
+    assert _run(sp.handle_command("UPDATE_CONFIG", _hub_push()))["status"] == "SUCCESS"
+    before = _snapshot(tmp_path, sp)
+
+    async def _ids():
+        return []
+
+    async def _fail(ldif):
+        if "olcSyncrepl" in ldif:
+            raise spoke_mod._CertInstallError("ldapmodify failed: Other (e.g., implementation specific) error")
+    sp._read_server_ids, sp._ldapmodify = _ids, _fail
+    # New Entra key + base DN + peers: every step runs before replication fails.
+    res = _run(sp.handle_command("UPDATE_CONFIG", _hub_push(
+        LDAP_BASE_DN="dc=new,dc=y", LDAP_SERVER_ID="1", LDAP_MIRROR_PEERS='["ldap://p:389"]',
+        ENTRA_CLIENT_KEY=_PEM_KEY.replace("AAA=", "ZZZ="))))
+    assert res["status"] == "ERROR" and "not applied" in res["message"], res
+    manager, config, files = _snapshot(tmp_path, sp)
+    assert manager is before[0] and config == before[1] and files == before[2]
+
+
+def test_failed_mirror_modify_restores_the_previous_server_id(tmp_path, monkeypatch):
+    monkeypatch.setenv("LDAP_ENV_PATH", str(tmp_path / ".env"))
+    sp = _spoke()
+    applied = []
+
+    async def _ids():
+        return [b"3"]
+
+    async def _modify(ldif):
+        applied.append(ldif)
+        if "olcSyncrepl" in ldif:
+            raise spoke_mod._CertInstallError('ldapmodify failed: bad olcSyncrepl credentials="pw" rid=001')
+    sp._read_server_ids, sp._ldapmodify = _ids, _modify
+    res = _run(sp.handle_command("UPDATE_CONFIG", _hub_push(
+        LDAP_SERVER_ID="1", LDAP_MIRROR_PEERS='["ldap://p:389"]', LDAP_ADMIN_PW="s3cr3t-pw")))
+    assert res["status"] == "ERROR"
+    # Neither the quoted credentials nor the raw password reach the reply.
+    assert "credentials=***" in res["message"] and '"pw"' not in res["message"]
+    server_id_writes = [l for l in applied if "olcServerID" in l]
+    assert "olcServerID: 1" in server_id_writes[0] and "olcServerID: 3" in server_id_writes[-1]
+    # syncrepl and mirror mode go in one modify record.
+    mirror = next(l for l in applied if "olcSyncrepl" in l)
+    assert "replace: olcMirrorMode" in mirror and mirror.count("dn:") == 1
+
+
+def test_an_unchanged_server_id_is_not_rewritten(tmp_path, monkeypatch):
+    monkeypatch.setenv("LDAP_ENV_PATH", str(tmp_path / ".env"))
+    sp = _spoke()
+    applied = []
+
+    async def _ids():
+        return [b"1"]
+
+    async def _modify(ldif):
+        applied.append(ldif)
+    sp._read_server_ids, sp._ldapmodify = _ids, _modify
+    res = _run(sp.handle_command("UPDATE_CONFIG", _hub_push(
+        LDAP_SERVER_ID="1", LDAP_MIRROR_PEERS='["ldap://p:389"]')))
+    assert res["status"] == "SUCCESS", res
+    assert not any("olcServerID" in l for l in applied)
+
+
+def test_read_server_ids_parses_ldapsearch_output():
+    sp = _spoke()
+
+    async def _search(tool, args, stdin=b""):
+        assert tool == "ldapsearch" and "olcServerID" in args
+        return (b"dn: cn=config\nolcServerID: 2 ldap://a:389\nolcServerID:: Mw==\n"
+                b"olcServerID: 4 ldap://folded-\n host:389\n\n")
+    sp._run_ldapi = _search
+    assert _run(sp._read_server_ids()) == [b"2 ldap://a:389", b"3", b"4 ldap://folded-host:389"]
+
+
+def test_spoke_imports_without_python_ldap_ldif():
+    """CI can't build python-ldap and stubs only the ldap package, so the
+    spoke must not import python-ldap's top-level ldif module."""
+    src = (Path(spoke_mod.__file__)).read_text()
+    assert not re.search(r"^\s*(import ldif|from ldif )", src, re.M)
+
+
+def test_server_id_ldif_round_trips_any_value():
+    values = [b"1 ldap://a:389", b" lead", b"\xc3\xa9t\xc3\xa9", b"x:y"]
+    out = LdapSpoke._server_id_ldif(values)
+    assert "olcServerID: 1 ldap://a:389" in out and "replace: olcServerID" in out
+
+    async def _search(tool, args, data=None):
+        return out.encode()
+    sp = _spoke()
+    sp._run_ldapi = _search
+    assert _run(sp._read_server_ids()) == values
+    assert "delete: olcServerID" in LdapSpoke._server_id_ldif([])
+
+
+def test_ldapi_timeout_kills_and_reaps_the_tool(monkeypatch):
+    calls = []
+
+    class _Proc:
+        returncode = None
+
+        async def communicate(self, input=None):
+            await asyncio.sleep(3600)
+
+        def kill(self):
+            calls.append("kill")
+
+        async def wait(self):
+            calls.append("wait")
+
+    async def _exec(*a, **k):
+        return _Proc()
+
+    async def _wait_for(coro, timeout):
+        coro.close()
+        raise asyncio.TimeoutError
+    monkeypatch.setattr(spoke_mod.asyncio, "create_subprocess_exec", _exec)
+    monkeypatch.setattr(spoke_mod.asyncio, "wait_for", _wait_for)
+    with pytest.raises(spoke_mod._CertInstallError, match="timed out"):
+        _run(_spoke()._run_ldapi("ldapmodify", [], b""))
+    assert calls == ["kill", "wait"]
+
+
+def test_update_config_pushes_are_serialised(tmp_path, monkeypatch):
+    monkeypatch.setenv("LDAP_ENV_PATH", str(tmp_path / ".env"))
+    sp = _spoke()
+    active, peak = [0], [0]
+
+    async def _ids():
+        return []
+
+    async def _modify(ldif):
+        active[0] += 1
+        peak[0] = max(peak[0], active[0])
+        await asyncio.sleep(0.01)
+        active[0] -= 1
+    sp._read_server_ids, sp._ldapmodify = _ids, _modify
+    push = _hub_push(LDAP_SERVER_ID="1", LDAP_MIRROR_PEERS='["ldap://p:389"]')
+
+    async def _both():
+        return await asyncio.gather(sp.handle_command("UPDATE_CONFIG", push),
+                                    sp.handle_command("UPDATE_CONFIG", push))
+    assert [r["status"] for r in _run(_both())] == ["SUCCESS", "SUCCESS"]
+    assert peak[0] == 1
+
+
+def test_persist_env_refuses_a_multiline_value(tmp_path, monkeypatch):
+    monkeypatch.setenv("LDAP_ENV_PATH", str(tmp_path / ".env"))
+    with pytest.raises(ValueError):
+        _spoke()._persist_env({"ENTRA_TENANT_ID": "t\nLDAP_ADMIN_PW=x"})
+
+
+def test_empty_admin_password_is_never_sent_as_a_bind():
+    binds = []
+    conn = types.SimpleNamespace(simple_bind_s=lambda dn, pw: binds.append((dn, pw)))
+    mgr = spoke_mod.LdapManager("cn=admin,dc=x", "", "dc=x")
+    with pytest.raises(spoke_mod.LdapBindError):
+        mgr._bind(conn)
+    assert binds == []
+
+
+def test_redaction_survives_a_quote_in_the_password():
+    pw = 'Pa"ss w0rd'
+    out = LdapSpoke._redact_credentials(f'bad credentials="{pw}" rid=001 ({pw})', pw)
+    assert "w0rd" not in out and "credentials=***" in out
