@@ -71,6 +71,10 @@ class _CertInstallError(Exception):
     """A failed cert-install step (ldapmodify / slapd restart). Raised inside
     install_cert so it maps to a single ERROR result with a clear message."""
 
+class _CertInstallRefusalError(_CertInstallError):
+    """slapd cleanly refused ldapmodify with a non-zero exit code (cn=config untouched)."""
+
+
 class LdapSpoke(BaseSpoke):
     """
     LDAP integration spoke. Hosts the LDAP server and provides a management API.
@@ -99,11 +103,11 @@ class LdapSpoke(BaseSpoke):
         # One UPDATE_CONFIG at a time: each one snapshots and may roll back
         # .env, the PEM files and cn=config, so two interleaved pushes could
         # restore each other's half-applied state.
-        self._update_config_lock = asyncio.Lock()
+        self._update_config_lock = None
         # INSTALL_CERT runs snapshot -> apply -> rollback as one transaction.
         # The control plane runs commands concurrently, so without this lock
         # a failing install could roll back over one that already succeeded.
-        self._cert_lock = asyncio.Lock()
+        self._cert_lock = None
 
     # Refresh floor for the OU list, in seconds (fleet-rules 4.8: minutes).
     _OU_CACHE_TTL = 300
@@ -574,6 +578,20 @@ class LdapSpoke(BaseSpoke):
         # Join the lines into LDIF text.
         return "\n".join(blocks) + "\n"
 
+    @property
+    def cert_lock(self) -> asyncio.Lock:
+        """Lazy asyncio.Lock for serialising certificate installs."""
+        if self._cert_lock is None:
+            self._cert_lock = asyncio.Lock()
+        return self._cert_lock
+
+    @property
+    def update_config_lock(self) -> asyncio.Lock:
+        """Lazy asyncio.Lock for serialising UPDATE_CONFIG operations."""
+        if self._update_config_lock is None:
+            self._update_config_lock = asyncio.Lock()
+        return self._update_config_lock
+
     async def install_cert(self, fullchain: str, privkey: str,
                            ca_pem: str = "") -> Dict[str, Any]:
         """Install a Let's Encrypt cert as slapd's TLS server cert.
@@ -610,7 +628,7 @@ class LdapSpoke(BaseSpoke):
         async def _serialised() -> Dict[str, Any]:
             """Steps 1-3 under the cert lock, so one install's snapshot and
             rollback never interleave with another's writes."""
-            async with self._cert_lock:
+            async with self.cert_lock:
                 # Step 1: record the live files and olcTLS* paths, so any
                 # failure below can put them back. slapd re-reads these files
                 # on its next restart: a half-installed or mismatched cert/key
@@ -662,8 +680,13 @@ class LdapSpoke(BaseSpoke):
             attrs_touched = True
             try:
                 await self._ldapmodify(self._build_tls_ldif(cert_path, key_path, ca_path))
-            except _CertInstallError:
+            except _CertInstallRefusalError:
+                # slapd cleanly refused the modify whole (non-zero exit): cn=config was not touched
                 attrs_touched = False
+                raise
+            except BaseException:
+                # Timeout, cancellation, or unconfirmed state: cn=config may have been modified!
+                # attrs_touched remains True so _rollback_cert restores olcTLS* in cn=config.
                 raise
             if do_restart:
                 restarted = True
@@ -764,14 +787,18 @@ class LdapSpoke(BaseSpoke):
         """Put every path back as ``_snapshot_files`` recorded it: content,
         mode and owner, or the symlink, or remove a file that was absent.
         Each one is swapped in atomically. Raises OSError on a failure."""
+        # Step 1: iterate over each recorded path snapshot.
         for path, old in snap.items():
             tmp = f"{path}.tmp"
+            # Step 2: remove path if it was previously absent.
             if old is None:
                 if os.path.lexists(path):
                     os.unlink(path)
                 continue
+            # Step 3: ensure temporary staging file is clean.
             if os.path.lexists(tmp):
                 os.unlink(tmp)
+            # Step 4: restore symlink or write file content with original mode/owner.
             if old[0] == "link":
                 os.symlink(old[1], tmp)
             else:
@@ -781,6 +808,7 @@ class LdapSpoke(BaseSpoke):
                     f.write(data)
                 os.chmod(tmp, mode)
                 os.chown(tmp, uid, gid)
+            # Step 5: atomically replace live path with restored staging file.
             os.replace(tmp, path)
 
     async def _rollback_cert(self, snap: Dict[str, Any], old_attrs: Dict[str, str],
@@ -885,6 +913,8 @@ class LdapSpoke(BaseSpoke):
         if proc.returncode != 0:
             err = (stderr.decode(errors="replace").strip() or stdout.decode(errors="replace").strip()
                    or f"{tool} exited {proc.returncode}")
+            if tool == "ldapmodify":
+                raise _CertInstallRefusalError(f"{tool} failed: {err[:300]}")
             raise _CertInstallError(f"{tool} failed: {err[:300]}")
         return stdout
 
@@ -947,7 +977,7 @@ class LdapSpoke(BaseSpoke):
         additive and harmless without olcSyncrepl. Pushes are serialised."""
         # Log key names only; the payload carries the admin password and Entra key.
         logger.info("Updating LDAP configuration (keys: %s)", sorted(data.keys()))
-        async with self._update_config_lock:
+        async with self.update_config_lock:
             return await self._update_config_locked(data)
 
     async def _update_config_locked(self, data: Dict[str, Any]) -> Dict[str, Any]:

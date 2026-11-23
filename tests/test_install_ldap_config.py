@@ -284,4 +284,4 @@ def test_release_removes_only_our_hold(tmp_path):
     foreign = "#!/bin/sh\nexit 101\n"
     res, policy = _run_hold(tmp_path, "hold_slapd_start && release_slapd_start", existing=foreign)
     assert res.returncode == 0 and policy.read_text() == foreign
-    assert "not adding the slapd start hold" in res.stderr
+    assert "chaining slapd start hold" in res.stderr

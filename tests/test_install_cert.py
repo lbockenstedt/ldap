@@ -267,6 +267,8 @@ def _scripted_exec(spoke_mod, calls, script, search_out=b""):
 
             async def communicate(self, input=None):
                 entry["stdin"] = input.decode() if input is not None else None
+                if rc == "timeout":
+                    raise asyncio.TimeoutError()
                 out = search_out if bin_ == "ldapsearch" else b""
                 return out, (b"boom" if rc else b"")
         return _P()
@@ -297,6 +299,24 @@ def _install(d, script, search_out=b"", **cfg):
 def _names(calls):
     return [c["argv"][0] for c in calls]
 
+
+
+
+def test_timed_out_modify_restores_files_and_cn_config():
+    old = (b"dn: cn=config\nolcTLSCertificateFile: /old/cert.pem\n"
+           b"olcTLSCertificateKeyFile:: L29sZC9rZXkucGVt\n\n")
+    with tempfile.TemporaryDirectory() as d:
+        _seed_old(d)
+        res, calls = _install(d, {"ldapmodify": ["timeout", 0]}, search_out=old)
+        assert res["status"] == "ERROR" and "error" not in res
+        assert "ldapmodify timed out" in res["message"]
+        assert open(f"{d}/slapd-cert.pem").read() == _OLD_CERT
+        assert open(f"{d}/slapd-key.pem").read() == _OLD_KEY
+        # The first ldapmodify timed out; cn=config may have applied it, so undo modify was run!
+        assert _names(calls) == ["ldapsearch", "ldapmodify", "ldapmodify"]
+        undo = calls[2]["stdin"]
+        assert "olcTLSCertificateFile:: " + base64.b64encode(b"/old/cert.pem").decode() in undo
+        assert "olcTLSCertificateKeyFile:: " + base64.b64encode(b"/old/key.pem").decode() in undo
 
 def test_refused_modify_restores_previous_files_and_skips_restart():
     with tempfile.TemporaryDirectory() as d:
