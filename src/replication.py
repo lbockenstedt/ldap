@@ -33,14 +33,24 @@ DEFAULT_DB_DN = "olcDatabase={1}mdb,cn=config"
 
 
 def _clean_peers(peers) -> List[str]:
-    """Filter and clean list of peer LDAP URLs, removing empty or whitespace items."""
-    # Keep each non-empty peer URL with surrounding whitespace removed.
+    """Return the non-blank peer URLs from a list of URL strings or of the hub's
+    ``{"server_id", "url"}`` dicts (lm routes/ldap.py normalize_mirror_peers).
+    Raises ValueError for anything else, so a bad payload is reported, not
+    half-applied."""
+    if peers is None:
+        return []
+    if not isinstance(peers, (list, tuple)):
+        raise ValueError("mirror peers must be a list")
+    # Take the URL from each entry and drop blanks.
     out = []
-    for p in peers or []:
+    for p in peers:
+        if isinstance(p, dict):
+            p = p.get("url")
+        if p is not None and not isinstance(p, str):
+            raise ValueError(f"mirror peer must be a URL or {{server_id, url}}, got {type(p).__name__}")
         p = (p or "").strip()
         if p:
             out.append(p)
-    # Return the cleaned list.
     return out
 
 

@@ -87,7 +87,7 @@ The following commands are handled by `LdapSpoke`:
 | Command | Arguments | Description |
 | :--- | :--- | :--- |
 | `GET_VERSION` | *None* | Retrieves the module semantic version from the `VERSION` file. |
-| `UPDATE_CONFIG` | `LDAP_SERVER_URL`, `LDAP_ADMIN_DN`, `LDAP_ADMIN_PW`, `LDAP_BASE_DN`, Entra/Replication settings | Re-initializes `LdapManager`, persists `.env` changes, and re-applies mirror-mode configuration. |
+| `UPDATE_CONFIG` | `LDAP_SERVER_URL`, `LDAP_ADMIN_DN`, `LDAP_ADMIN_PW`, `LDAP_BASE_DN`, Entra/Replication settings | Merges into the current config, re-initializes `LdapManager`, persists `.env` (Entra PEMs as 0600 files), and re-applies mirror-mode configuration, as one transaction: the running config switches only after every step applied; an unusable mirror section (non-integer `LDAP_SERVER_ID` or malformed peers) skips only replication and returns PARTIAL; a failed step returns ERROR and leaves `.env`, the PEM files, `olcServerID` and the running config as they were. |
 | `LIST_OUS` | *None* | Lists all Organizational Units under the configured directory base DN. |
 | `CREATE_OU` | `name`, `parent_dn` | Creates a new Organizational Unit under the base DN or a specified parent DN. |
 | `UPDATE_OU` | `dn`, `name` | Renames an existing Organizational Unit via LDAP `modrdn`. |
@@ -100,7 +100,7 @@ The following commands are handled by `LdapSpoke`:
 | `ADD_USER_TO_GROUP` | `user_dn`, `group_dn` | Adds a user's distinguished name to the target group's `member` list. |
 | `REMOVE_USER_FROM_GROUP` | `user_dn`, `group_dn` | Removes a user's distinguished name from the target group's `member` list. |
 | `SET_PASSWORD` | `user_dn`, `password` | Sets a user's password using the Password-Modify extended operation or direct `{SSHA}` hash update. |
-| `DELETE_ENTITY` | `dn` | Deletes any leaf directory entity (user, group, or OU) by DN. |
+| `DELETE_ENTITY` | `dn` | Deletes any leaf directory entity (user, group, or OU) by DN, and removes that DN from every group that lists it. |
 | `SEARCH_USERS` | `q`, `tenant`, `is_admin` | Global search query matching `uid`, `cn`, `mail`, and `dNSHostName` with tenant scoping. |
 | `LDAP_MIGRATE_TENANT` | `source_base_dn`, `target_base_dn`, `purge_source` | Re-homes directory entries from an old tenant base DN to a new target base DN. |
 | `LDAP_PROVISION_TENANT_OU` | `tenant_slug` | Idempotently provisions a tenant tree (`ou=<slug>`, `ou=users`, `ou=groups`). |

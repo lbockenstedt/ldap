@@ -79,6 +79,26 @@ class LdapBindError(Exception):
 # directory, so a process lock is enough).
 _UID_LOCK = threading.Lock()
 
+# Serialises membership adds and DN moves with entry deletes, so a member
+# can't be added (or repointed) to a DN between delete_entity's membership
+# sweep and its delete, which would leave a dangling member value for a later
+# entry with the same DN to inherit. Same one-process scope as _UID_LOCK.
+_MEMBERSHIP_LOCK = threading.Lock()
+
+# Immutable per-entry identity attributes, in preference order: entryUUID
+# (RFC 4530: OpenLDAP, 389-DS 2.x) and nsUniqueId (389-DS 1.4, FreeIPA).
+_IDENTITY_ATTRS = ('entryUUID', 'nsUniqueId')
+
+
+def _identity_filter(attrs: dict):
+    """Return an equality filter on the first identity attribute ``attrs``
+    has, e.g. ``(entryUUID=...)``, or None when it has neither."""
+    for name in _IDENTITY_ATTRS:
+        value = next((v for k, vs in attrs.items() if k.lower() == name.lower() for v in vs), b'')
+        if value:
+            return f"({name}={ldap.filter.escape_filter_chars(value.decode('utf-8'))})"
+    return None
+
 
 class PartialRollbackError(Exception):
     """A failed move/rename whose undo also failed: the directory is left
@@ -151,6 +171,11 @@ class LdapManager:
         (it's not an ``LDAPError``), so a bind failure surfaces as a clean
         ``INVALID_CREDENTIALS`` envelope at the spoke, not a cryptic per-method
         log line or a control-plane traceback."""
+        # An empty password would be an unauthenticated (anonymous) bind, not
+        # the admin: refuse it with the same actionable error.
+        if not self.admin_pw:
+            raise LdapBindError("LDAP bind refused: LDAP_ADMIN_PW is not set — set the "
+                                "admin password via Setup → LDAP (UPDATE_CONFIG).")
         # Simple bind with the admin DN and password.
         try:
             conn.simple_bind_s(self.admin_dn, self.admin_pw)
@@ -328,11 +353,21 @@ class LdapManager:
             return {"status": "ERROR", "message": str(e)}
 
     def add_user_to_group(self, user_dn: str, group_dn: str) -> Dict[str, Any]:
-        """Add a member DN to the specified group entry."""
-        # Bind, then add the user's DN to the group's member attribute.
+        """Add a member DN to the specified group entry.
+
+        The member entry must exist: a DN that was deleted (or never created)
+        would be a dangling member that a later entry with that DN inherits.
+        The check and the add run under _MEMBERSHIP_LOCK so a concurrent
+        delete_entity can't slip between them."""
+        # Bind, check the member exists, then add its DN to the group's member attribute.
         conn = self._get_connection()
         try:
-            conn.modify_s(group_dn, [(ldap.MOD_ADD, 'member', [user_dn.encode('utf-8')])])
+            with _MEMBERSHIP_LOCK:
+                try:
+                    conn.search_s(user_dn, ldap.SCOPE_BASE, "(objectClass=*)", ['1.1'])
+                except ldap.NO_SUCH_OBJECT:
+                    return {"status": "ERROR", "message": f"member entry not found: {user_dn}"}
+                conn.modify_s(group_dn, [(ldap.MOD_ADD, 'member', [user_dn.encode('utf-8')])])
             return {"status": "SUCCESS"}
         # LDAP error (e.g. already a member): log and report it.
         except ldap.LDAPError as e:
@@ -340,11 +375,15 @@ class LdapManager:
             return {"status": "ERROR", "message": str(e)}
 
     def remove_user_from_group(self, user_dn: str, group_dn: str) -> Dict[str, Any]:
-        """Remove a member DN from the specified group entry."""
+        """Remove a member DN from the specified group entry.
+
+        Runs under _MEMBERSHIP_LOCK, like the add: a removal landing inside
+        delete_entity's sweep would otherwise be undone by its rollback."""
         # Bind, then delete the user's DN from the group's member attribute.
         conn = self._get_connection()
         try:
-            conn.modify_s(group_dn, [(ldap.MOD_DELETE, 'member', [user_dn.encode('utf-8')])])
+            with _MEMBERSHIP_LOCK:
+                conn.modify_s(group_dn, [(ldap.MOD_DELETE, 'member', [user_dn.encode('utf-8')])])
             return {"status": "SUCCESS"}
         # LDAP error (e.g. not a member): log and report it.
         except ldap.LDAPError as e:
@@ -369,16 +408,177 @@ class LdapManager:
                 return {"status": "ERROR", "message": str(e)}
 
     def delete_entity(self, dn: str) -> Dict[str, Any]:
-        """Delete an LDAP entry by distinguished name."""
-        # Bind, then delete the entry.
+        """Delete an LDAP entry by distinguished name, with its group memberships.
+
+        groupOfNames stores members as DNs, and no refint overlay is configured
+        (the spoke may manage a server it can't reconfigure, see
+        ``_rewrite_memberships``). Deleting only the entry left its DN in every
+        group, so a user created later with the same DN silently inherited
+        those groups and their access. So the DN is removed from every group
+        under the base DN first, then the entry is deleted.
+
+        Identity, not the DN, decides what a failure left behind. The entry's
+        identity (entryUUID, RFC 4530; or 389-DS's nsUniqueId) is read first;
+        the delete carries an RFC 4528 assertion on it, so it can only remove
+        that entry, never a same-DN replacement. A server that refuses the
+        assertion control gets a plain delete right after the identity is
+        re-checked at the DN; a server with neither attribute is handled by
+        DN alone (both logged). On any error (a rejected or lost delete, or a
+        failed sweep) the base DN is searched for that identity (or the DN
+        is read, without one): found at the same DN means the entry
+        survived, and its memberships are put back; not found means it is gone
+        and they stay removed; found elsewhere (renamed by another writer) or a
+        failed search leaves them removed (fail closed: a missing membership is
+        fixable, a dangling one grants a future same-DN entry the old access)
+        and the ERROR names them. The whole operation holds _MEMBERSHIP_LOCK,
+        so no membership add or move from this spoke lands in between."""
+        # Bind and read the entry's immutable identity.
         conn = self._get_connection()
-        try:
+        with _MEMBERSHIP_LOCK:
+            try:
+                found = conn.search_s(dn, ldap.SCOPE_BASE, '(objectClass=*)', list(_IDENTITY_ATTRS))
+            except ldap.NO_SUCH_OBJECT:
+                return {"status": "ERROR", "message": f"entry not found: {dn}"}
+            except ldap.LDAPError as e:
+                logger.error(f"Error reading {dn} before delete: {e}")
+                return {"status": "ERROR", "message": str(e)}
+            ident = _identity_filter(next((a for _d, a in found if _d), {}))
+            if ident is None:
+                logger.warning(f"{dn} has no entryUUID/nsUniqueId; deleting by DN alone")
+            # Drop the memberships, then delete only the entry with that identity.
+            removed: list = []
+            try:
+                self._drop_memberships(conn, dn, removed)
+                self._delete_by_identity(conn, dn, ident)
+                return {"status": "SUCCESS"}
+            except ldap.LDAPError as e:
+                logger.error(f"Error deleting entity {dn}: {e}")
+                return self._undo_failed_delete(conn, dn, ident, removed, str(e))
+
+    def _delete_by_identity(self, conn, dn: str, ident) -> None:
+        """Delete ``dn`` only if it is still the entry ``ident`` matches.
+
+        Sends a critical RFC 4528 assertion. A server that doesn't support it
+        answers UNAVAILABLE_CRITICAL_EXTENSION without deleting; it gets a
+        base search for the identity at ``dn`` and then a plain delete (a
+        replacement can only slip into that gap from another LDAP writer).
+        With no identity (``ident`` None), the DN is deleted as is."""
+        if ident is None:
             conn.delete_s(dn)
-            return {"status": "SUCCESS"}
-        # LDAP error (e.g. entry has children): log and report it.
+            return
+        # Imported here: only deletes need it, and it keeps the module
+        # importable where python-ldap is stubbed.
+        from ldap.controls.libldap import AssertionControl
+        try:
+            conn.delete_ext_s(dn, serverctrls=[AssertionControl(True, ident)])
+            return
+        except ldap.UNAVAILABLE_CRITICAL_EXTENSION:
+            logger.warning(f"server refused the assertion control; re-checking {dn} before a plain delete")
+        # A different entry at the DN (or none) fails like a refused assertion.
+        if not [d for d, _a in conn.search_s(dn, ldap.SCOPE_BASE, ident, ['1.1']) if d]:
+            raise ldap.ASSERTION_FAILED({"desc": "entry at the DN is no longer the one read"})
+        conn.delete_s(dn)
+
+    def _undo_failed_delete(self, conn, dn: str, ident, removed: list,
+                            msg: str) -> Dict[str, Any]:
+        """Decide what a failed sweep or delete left behind, by identity.
+
+        ``ident`` is the identity filter from ``_identity_filter``; with none,
+        only ``dn`` is read, so a same-DN entry is taken to be the original.
+
+        Entry still at ``dn``: nothing was deleted, so the memberships are put
+        back (ERROR). Entry gone: it was deleted (by this call with a lost
+        reply, or by another writer) and the memberships stay removed
+        (SUCCESS). Entry moved, or the search failed: fail closed, leave the
+        memberships removed and name them in the ERROR."""
+        # Find the entry by identity anywhere under the base DN.
+        groups = ", ".join(g for g, _ in removed)
+        try:
+            if ident is None:
+                try:
+                    hits = [d for d, _a in conn.search_s(dn, ldap.SCOPE_BASE, '(objectClass=*)', ['1.1']) if d]
+                except ldap.NO_SUCH_OBJECT:
+                    hits = []
+            else:
+                hits = [d for d, _a in conn.search_s(
+                    self.base_dn, ldap.SCOPE_SUBTREE, ident, ['1.1']) if d]
         except ldap.LDAPError as e:
-            logger.error(f"Error deleting entity {dn}: {e}")
-            return {"status": "ERROR", "message": str(e)}
+            logger.error(f"Could not check whether {dn} still exists: {e}")
+            if removed:
+                msg += "; delete outcome unknown, group memberships left removed: " + groups
+            return {"status": "ERROR", "message": msg}
+        # Gone: the end state asked for; the memberships stay removed.
+        if not hits:
+            return {"status": "SUCCESS", "message": "entry deleted; the server reply was an error: " + msg}
+        # Moved by another writer: its old-DN memberships must not come back.
+        if not any(h.lower() == dn.lower() for h in hits):
+            if removed:
+                msg += f"; entry now at {hits[0]}, group memberships left removed: " + groups
+            return {"status": "ERROR", "message": msg}
+        # Still here: nothing was deleted, so undo the sweep.
+        failed = self._restore_memberships(conn, dn, removed)
+        if failed:
+            msg += "; group memberships not restored: " + ", ".join(failed)
+        return {"status": "ERROR", "message": msg}
+
+    def _drop_memberships(self, conn, dn: str, removed: list) -> None:
+        """Remove ``dn`` from every groupOfNames under the base DN that lists it.
+
+        A group whose only member is ``dn`` gets the base DN placeholder in the
+        same modify (groupOfNames requires at least one member, as in
+        ``create_group``). Each group is appended to ``removed`` as
+        ``(group_dn, placeholder_added)`` before its modify is sent, so the
+        caller can undo (or report) it even if the reply is lost."""
+        # Find the groups that list the DN (the server matches DNs by rule,
+        # so case and spacing differences still match).
+        safe = ldap.filter.escape_filter_chars(dn)
+        try:
+            groups = conn.search_s(self.base_dn, ldap.SCOPE_SUBTREE,
+                                   f"(&(objectClass=groupOfNames)(member={safe}))",
+                                   ['member'])
+        # No base entry means there are no groups to clean.
+        except ldap.NO_SUCH_OBJECT:
+            return
+        target = dn.encode('utf-8')
+        placeholder = self.base_dn.encode('utf-8')
+        for gdn, attrs in groups:
+            if not gdn:
+                continue
+            # The last member is swapped for the placeholder in one modify.
+            add_placeholder = len(attrs.get('member', [])) <= 1 and target != placeholder
+            mods = [(ldap.MOD_ADD, 'member', [placeholder])] if add_placeholder else []
+            mods.append((ldap.MOD_DELETE, 'member', [target]))
+            # Recorded first: a modify whose reply is lost may still have applied.
+            removed.append((gdn, add_placeholder))
+            try:
+                conn.modify_s(gdn, mods)
+            # Already gone: another writer removed it after the search. Not
+            # ours to undo, so a rollback must not put it back.
+            except ldap.NO_SUCH_ATTRIBUTE:
+                removed.pop()
+
+    def _restore_memberships(self, conn, dn: str, removed: list) -> list:
+        """Put ``dn`` back into the groups ``_drop_memberships`` changed.
+
+        A group that already lists ``dn`` is skipped (its sweep modify never
+        applied). Returns the group DNs that could not be restored (best
+        effort: one failure does not stop the rest)."""
+        failed = []
+        target = dn.encode('utf-8')
+        for gdn, add_placeholder in reversed(removed):
+            # Re-add the member first, then drop the placeholder it replaced.
+            mods = [(ldap.MOD_ADD, 'member', [target])]
+            if add_placeholder:
+                mods.append((ldap.MOD_DELETE, 'member', [self.base_dn.encode('utf-8')]))
+            try:
+                conn.modify_s(gdn, mods)
+            # Already a member: the sweep's modify for this group never applied.
+            except ldap.TYPE_OR_VALUE_EXISTS:
+                continue
+            except ldap.LDAPError as e:
+                logger.error(f"Could not restore {dn} in group {gdn}: {e}")
+                failed.append(gdn)
+        return failed
 
     def _rename(self, conn, dn: str, new_rdn: str) -> None:
         """Rename an entry's RDN (modrdn). The old RDN value is deleted."""
@@ -1016,7 +1216,15 @@ class LdapManager:
 
         If repointing fails, the group changes already made and the rename are
         undone before the error is re-raised, so a failed move or OU rename
-        leaves the directory as it was. Returns the number of groups changed."""
+        leaves the directory as it was. Returns the number of groups changed.
+        Runs under _MEMBERSHIP_LOCK: the repointing adds member values, which
+        must not race a delete of the new DN."""
+        with _MEMBERSHIP_LOCK:
+            return self._move_entry_locked(conn, old_dn, new_dn, moved, tenant_slug)
+
+    def _move_entry_locked(self, conn, old_dn: str, new_dn: str, moved: Dict[str, str],
+                           tenant_slug: Optional[str]) -> int:
+        """``_move_entry``'s body; the caller holds _MEMBERSHIP_LOCK."""
         old_parts, new_parts = split_dn_raw(old_dn), split_dn_raw(new_dn)
         conn.rename_s(old_dn, new_parts[0], ",".join(new_parts[1:]), 1)
         done: list = []
