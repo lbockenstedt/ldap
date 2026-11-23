@@ -19,6 +19,7 @@ def _load_manager(monkeypatch):
     lm.LDAPError = type("LDAPError", (Exception,), {})
     lm.ALREADY_EXISTS = type("ALREADY_EXISTS", (lm.LDAPError,), {})
     lm.INVALID_CREDENTIALS = type("INVALID_CREDENTIALS", (lm.LDAPError,), {})
+    lm.NO_SUCH_OBJECT = type("NO_SUCH_OBJECT", (lm.LDAPError,), {})
     lm.SCOPE_SUBTREE, lm.SCOPE_BASE, lm.SCOPE_ONELEVEL = 2, 0, 1
     lm.MOD_ADD, lm.MOD_DELETE, lm.MOD_REPLACE = 0, 1, 2
     lm.filter = types.ModuleType("ldap.filter")
@@ -27,8 +28,17 @@ def _load_manager(monkeypatch):
     lm.dn.escape_dn_chars = lambda v: v
     lm.modlist = types.ModuleType("ldap.modlist")
     lm.modlist.addModlist = lambda entry: [(k, v) for k, v in entry.items() if v]
+    lm.TYPE_OR_VALUE_EXISTS = type("TYPE_OR_VALUE_EXISTS", (lm.LDAPError,), {})
+    lm.ASSERTION_FAILED = type("ASSERTION_FAILED", (lm.LDAPError,), {})
+    lm.NO_SUCH_ATTRIBUTE = type("NO_SUCH_ATTRIBUTE", (lm.LDAPError,), {})
+    lm.UNAVAILABLE_CRITICAL_EXTENSION = type("UNAVAILABLE_CRITICAL_EXTENSION", (lm.LDAPError,), {})
+    lm.controls = types.ModuleType("ldap.controls")
+    lm.controls.libldap = types.ModuleType("ldap.controls.libldap")
+    lm.controls.libldap.AssertionControl = lambda criticality, filterstr: ("assert", filterstr)
     for name, mod in (("ldap", lm), ("ldap.filter", lm.filter),
-                      ("ldap.dn", lm.dn), ("ldap.modlist", lm.modlist)):
+                      ("ldap.dn", lm.dn), ("ldap.modlist", lm.modlist),
+                      ("ldap.controls", lm.controls),
+                      ("ldap.controls.libldap", lm.controls.libldap)):
         monkeypatch.setitem(sys.modules, name, mod)
     monkeypatch.syspath_prepend(str(ROOT / "src"))
     spec = importlib.util.spec_from_file_location("ldap_manager_calls_mgr",
@@ -48,6 +58,10 @@ class _StrictConn:
         if not (isinstance(modlist, list) and all(isinstance(t, tuple) for t in modlist)):
             raise TypeError("List_to_LDAPMods(): expected list of tuples")
         self.adds.append((dn, modlist))
+
+    def search_s(self, base, scope, filt, attrs=None):
+        """Every entry asked for exists."""
+        return [(base, {})]
 
     def modify_s(self, dn, modlist, *extra):
         if extra or not all(isinstance(t, tuple) and len(t) == 3 for t in modlist):
