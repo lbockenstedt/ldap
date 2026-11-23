@@ -36,6 +36,7 @@ class _FakeDir:
     def __init__(self, ldap, entries):
         self.ldap = ldap
         self.e = {dn.lower(): (dn, attrs) for dn, attrs in entries.items()}
+        self.assertion_supported = True
 
     def _under(self, dn, base, scope):
         """True when ``dn`` is in the search scope of ``base``."""
@@ -57,9 +58,9 @@ class _FakeDir:
             if not self._under(dn, base, scope):
                 continue
             classes = {c.decode().lower() for c in a.get("objectClass", [])}
-            if "*" not in wanted and not (classes & wanted):
+            if wanted and "*" not in wanted and not (classes & wanted):
                 continue
-            for attr in ("uid", "member"):
+            for attr in ("uid", "member", "entryUUID", "nsUniqueId"):
                 m = re.search(rf"\({attr}=([^)]*)\)", filt)
                 if m and m.group(1).lower() not in [v.decode().lower() for v in a.get(attr, [])]:
                     break
@@ -78,6 +79,10 @@ class _FakeDir:
     def modify_s(self, dn, modlist):
         assert all(isinstance(t, tuple) and len(t) == 3 for t in modlist)
         _dn, a = self.e[dn.lower()]
+        # Atomic, like LDAP: deleting a value that isn't there fails the whole modify.
+        for op, attr, vals in modlist:
+            if op == self.ldap.MOD_DELETE and not set(vals) <= set(a.get(attr, [])):
+                raise self.ldap.NO_SUCH_ATTRIBUTE(dn)
         for op, attr, vals in modlist:
             cur = a.setdefault(attr, [])
             if op == self.ldap.MOD_ADD:
@@ -107,6 +112,18 @@ class _FakeDir:
             raise self.ldap.LDAPError("not allowed on non-leaf")
         del self.e[dn.lower()]
 
+    def delete_ext_s(self, dn, serverctrls=None):
+        """delete_s honouring an ``(attr=value)`` assertion control."""
+        if serverctrls and not self.assertion_supported:
+            raise self.ldap.UNAVAILABLE_CRITICAL_EXTENSION(dn)
+        if dn.lower() not in self.e:
+            raise self.ldap.NO_SUCH_OBJECT(dn)
+        for _kind, filt in serverctrls or []:
+            attr, want = re.search(r"\((\w+)=([^)]*)\)", filt).groups()
+            if [want.encode()] != self.e[dn.lower()][1].get(attr):
+                raise self.ldap.ASSERTION_FAILED(dn)
+        self.delete_s(dn)
+
 
 def _ou(name):
     return {"objectClass": [b"organizationalUnit"], "ou": [name.encode()]}
@@ -114,7 +131,8 @@ def _ou(name):
 
 def _user(uid):
     return {"objectClass": [b"person", b"inetOrgPerson"], "uid": [uid.encode()],
-            "userPassword": [b"{SASL}" + uid.encode() + b"@corp.example"]}
+            "userPassword": [b"{SASL}" + uid.encode() + b"@corp.example"],
+            "entryUUID": [f"uuid-{uid}".encode()]}
 
 
 @pytest.fixture
@@ -514,3 +532,308 @@ def test_user_removed_during_the_move_is_not_reported_as_a_missing_ou(env, monke
     monkeypatch.setattr(fake, "rename_s", rename)
     assert mgr.move_user_scoped("alice", ["Sales"], "acme") == {
         "status": "ERROR", "message": "user not found: alice"}
+
+
+# ---- deleting an entry removes it from its groups -----------------------------
+
+def test_delete_user_drops_its_group_memberships(env):
+    """A recreated user with the same DN must not inherit the old groups."""
+    mgr, fake = env
+    fake.e[BASE.lower()] = (BASE, {"objectClass": [b"dcObject"]})
+    alice = f"uid=alice,ou=Lab,ou=Eng,{USERS}"
+    solo = f"cn=solo,{GROUPS}"
+    fake.e[solo.lower()] = (solo, {"objectClass": [b"groupOfNames"], "member": [alice.encode()]})
+    assert mgr.delete_user_scoped("alice", "acme")["status"] == "SUCCESS"
+    assert _members(fake) == [BASE]
+    # The only member is swapped for the base-DN placeholder (groupOfNames needs one).
+    assert fake.e[solo.lower()][1]["member"] == [BASE.encode()]
+    assert alice.lower() not in fake.e
+
+
+def test_failed_delete_restores_the_memberships(env):
+    mgr, fake = env
+    fake.e[BASE.lower()] = (BASE, {"objectClass": [b"dcObject"]})
+    alice = f"uid=alice,ou=Lab,ou=Eng,{USERS}"
+
+    def _refuse(dn, serverctrls=None):
+        raise fake.ldap.LDAPError("insufficient access")
+    fake.delete_ext_s = _refuse
+    res = mgr.delete_entity(alice)
+    assert res["status"] == "ERROR" and "insufficient access" in res["message"]
+    assert sorted(_members(fake)) == sorted([BASE, alice])
+
+
+def _alice_in_a_group(fake):
+    """Seed alice as an entry that is the only member of one group."""
+    fake.e[BASE.lower()] = (BASE, {"objectClass": [b"dcObject"]})
+    alice = f"uid=alice,{USERS}"
+    fake.e[alice.lower()] = (alice, {"objectClass": [b"inetOrgPerson"], "uid": [b"alice"],
+                                     "entryUUID": [b"uuid-alice-root"]})
+    solo = f"cn=solo,{GROUPS}"
+    fake.e[solo.lower()] = (solo, {"objectClass": [b"groupOfNames"], "member": [alice.encode()]})
+    return alice, solo
+
+
+def test_delete_that_lost_a_race_does_not_restore_the_memberships(env):
+    """Another writer deleted the entry after the sweep: a gone DN must not
+    be put back into its groups."""
+    mgr, fake = env
+    alice, solo = _alice_in_a_group(fake)
+
+    def _gone(dn, serverctrls=None):
+        fake.e.pop(dn.lower(), None)
+        raise fake.ldap.NO_SUCH_OBJECT(dn)
+    fake.delete_ext_s = _gone
+    assert mgr.delete_entity(alice)["status"] == "SUCCESS"
+    assert fake.e[solo.lower()][1]["member"] == [BASE.encode()]
+
+
+def test_delete_applied_but_reply_lost_does_not_restore(env):
+    """The server deleted the entry but the reply failed: memberships stay removed."""
+    mgr, fake = env
+    alice, solo = _alice_in_a_group(fake)
+
+    def _applied_then_error(dn, serverctrls=None):
+        fake.e.pop(dn.lower(), None)
+        raise fake.ldap.LDAPError("server down")
+    fake.delete_ext_s = _applied_then_error
+    assert mgr.delete_entity(alice)["status"] == "SUCCESS"
+    assert fake.e[solo.lower()][1]["member"] == [BASE.encode()]
+
+
+def test_delete_with_unknown_outcome_fails_closed(env):
+    """When the entry's existence can't be checked, the memberships stay
+    removed and the error names them."""
+    mgr, fake = env
+    alice, solo = _alice_in_a_group(fake)
+    def _down(dn, serverctrls=None):
+        def _search(base, *a, **k):
+            raise fake.ldap.LDAPError("server down")
+        fake.search_s = _search
+        raise fake.ldap.LDAPError("server down")
+    fake.delete_ext_s = _down
+    res = mgr.delete_entity(alice)
+    assert res["status"] == "ERROR" and solo in res["message"]
+    assert fake.e[solo.lower()][1]["member"] == [BASE.encode()]
+
+
+def test_a_group_gone_mid_sweep_is_not_reported_as_a_deleted_entry(env):
+    """NO_SUCH_OBJECT from a group modify must not read as "entry deleted":
+    the entry still exists, so the swept memberships come back."""
+    mgr, fake = env
+    alice, solo = _alice_in_a_group(fake)
+    # Swept after solo, and renamed by another writer before its modify.
+    late = f"cn=late,{GROUPS}"
+    fake.e[late.lower()] = (late, {"objectClass": [b"groupOfNames"],
+                                   "member": [BASE.encode(), alice.encode()]})
+    real_modify = fake.modify_s
+
+    def _modify(dn, mods):
+        if dn.lower() == late.lower():
+            raise fake.ldap.NO_SUCH_OBJECT(dn)
+        real_modify(dn, mods)
+    fake.modify_s = _modify
+    res = mgr.delete_entity(alice)
+    assert res["status"] == "ERROR"
+    assert alice.lower() in fake.e
+    assert fake.e[solo.lower()][1]["member"] == [alice.encode()]
+
+
+def test_a_same_dn_replacement_never_gets_the_old_memberships(env):
+    """The delete applied, the reply was lost, and a new entry took the DN
+    before the check: the new entry (another entryUUID) is not restored into
+    the old groups."""
+    mgr, fake = env
+    alice, solo = _alice_in_a_group(fake)
+
+    def _applied_recreated_then_error(dn, serverctrls=None):
+        fake.e[dn.lower()] = (dn, {"objectClass": [b"inetOrgPerson"], "uid": [b"alice"],
+                                   "entryUUID": [b"uuid-new"]})
+        raise fake.ldap.LDAPError("server down")
+    fake.delete_ext_s = _applied_recreated_then_error
+    fake.delete_s = _applied_recreated_then_error
+    assert mgr.delete_entity(alice)["status"] == "SUCCESS"
+    assert fake.e[solo.lower()][1]["member"] == [BASE.encode()]
+
+
+def test_the_delete_asserts_the_entry_it_swept(env):
+    """A replacement created between the sweep and the delete is not
+    deleted, and does not get the old memberships."""
+    mgr, fake = env
+    alice, solo = _alice_in_a_group(fake)
+    real_delete = fake.delete_ext_s
+
+    def _replaced_first(dn, serverctrls=None):
+        fake.e[dn.lower()][1]["entryUUID"] = [b"uuid-new"]
+        real_delete(dn, serverctrls)
+    fake.delete_ext_s = _replaced_first
+    res = mgr.delete_entity(alice)
+    assert res["status"] == "SUCCESS"  # the swept entry is gone
+    assert fake.e[alice.lower()][1]["entryUUID"] == [b"uuid-new"]
+    assert fake.e[solo.lower()][1]["member"] == [BASE.encode()]
+
+
+def test_an_entry_renamed_away_keeps_its_old_memberships_removed(env):
+    mgr, fake = env
+    alice, solo = _alice_in_a_group(fake)
+
+    def _renamed(dn, serverctrls=None):
+        fake.rename_s(dn, "uid=alice2")
+        raise fake.ldap.NO_SUCH_OBJECT(dn)
+    fake.delete_ext_s = _renamed
+    res = mgr.delete_entity(alice)
+    assert res["status"] == "ERROR" and solo in res["message"]
+    assert fake.e[solo.lower()][1]["member"] == [BASE.encode()]
+
+
+def test_a_lost_group_modify_reply_is_still_undone(env):
+    """The group modify applied but its reply was lost: the group is still
+    restored when the delete then fails."""
+    mgr, fake = env
+    alice, solo = _alice_in_a_group(fake)
+    real_modify = fake.modify_s
+
+    def _applied_then_lost(dn, mods):
+        real_modify(dn, mods)
+        if dn.lower() == solo.lower() and mods[-1][0] == fake.ldap.MOD_DELETE:
+            raise fake.ldap.LDAPError("server down")
+    fake.modify_s = _applied_then_lost
+    assert mgr.delete_entity(alice)["status"] == "ERROR"
+    assert alice.lower() in fake.e
+    assert fake.e[solo.lower()][1]["member"] == [alice.encode()]
+
+
+def test_concurrent_add_cannot_leave_a_deleted_user_in_a_group(env):
+    """An add racing the delete either lands before the sweep (and is swept)
+    or after the delete (and is refused): never in between."""
+    import threading
+    import time
+    mgr, fake = env
+    fake.e[BASE.lower()] = (BASE, {"objectClass": [b"dcObject"]})
+    bob = f"uid=bob,{USERS}"
+    real_delete = fake.delete_ext_s
+    out = {}
+
+    def _delete(dn, serverctrls=None):
+        # The sweep is done; another command adds bob to staff right now.
+        t = threading.Thread(target=lambda: out.update(
+            add=mgr.add_user_to_group(bob, f"cn=staff,{GROUPS}")))
+        t.start()
+        t.join(0.2)
+        out["thread"] = t
+        real_delete(dn, serverctrls)
+    fake.delete_ext_s = _delete
+    assert mgr.delete_entity(bob)["status"] == "SUCCESS"
+    out["thread"].join(2)
+    assert out["add"]["status"] == "ERROR" and "not found" in out["add"]["message"]
+    assert bob not in _members(fake)
+
+
+def test_add_member_refuses_a_missing_entry(env):
+    mgr, fake = env
+    ghost = f"uid=ghost,{USERS}"
+    res = mgr.add_user_to_group(ghost, f"cn=staff,{GROUPS}")
+    assert res == {"status": "ERROR", "message": f"member entry not found: {ghost}"}
+    assert ghost not in _members(fake)
+
+
+def test_a_removal_by_another_writer_is_not_undone(env):
+    """Another writer removed alice from a group after the sweep's search:
+    the failed delete's rollback must not put her back there."""
+    mgr, fake = env
+    alice, solo = _alice_in_a_group(fake)
+    two = f"cn=two,{GROUPS}"
+    fake.e[two.lower()] = (two, {"objectClass": [b"groupOfNames"],
+                                 "member": [BASE.encode(), alice.encode()]})
+    real_modify = fake.modify_s
+
+    def _modify(dn, mods):
+        if dn.lower() == two.lower() and alice.encode() in fake.e[two.lower()][1]["member"]:
+            fake.e[two.lower()][1]["member"].remove(alice.encode())
+        real_modify(dn, mods)
+    fake.modify_s = _modify
+
+    def _refuse(dn, serverctrls=None):
+        raise fake.ldap.LDAPError("insufficient access")
+    fake.delete_ext_s = _refuse
+    assert mgr.delete_entity(alice)["status"] == "ERROR"
+    assert fake.e[two.lower()][1]["member"] == [BASE.encode()]
+    assert fake.e[solo.lower()][1]["member"] == [alice.encode()]
+
+
+def test_remove_member_waits_for_a_running_delete(env):
+    import threading
+    mgr, fake = env
+    lock = type(mgr).delete_entity.__globals__["_MEMBERSHIP_LOCK"]
+    out = {}
+    with lock:
+        t = threading.Thread(target=lambda: out.update(r=mgr.remove_user_from_group(
+            f"uid=alice,ou=Lab,ou=Eng,{USERS}", f"cn=staff,{GROUPS}")))
+        t.start()
+        t.join(0.2)
+        assert t.is_alive() and "r" not in out
+    t.join(2)
+    assert out["r"]["status"] == "SUCCESS" and _members(fake) == [BASE]
+
+
+def test_delete_uses_nsuniqueid_when_there_is_no_entryuuid(env):
+    """389-DS 1.4 / FreeIPA entries carry nsUniqueId, not entryUUID."""
+    mgr, fake = env
+    alice, solo = _alice_in_a_group(fake)
+    a = fake.e[alice.lower()][1]
+    a["nsUniqueId"] = [a.pop("entryUUID")[0]]
+    seen = []
+    real_delete = fake.delete_ext_s
+    fake.delete_ext_s = lambda dn, serverctrls=None: (seen.extend(serverctrls), real_delete(dn, serverctrls))
+    assert mgr.delete_entity(alice)["status"] == "SUCCESS"
+    assert "nsUniqueId=uuid-alice-root" in seen[0][1]
+    assert alice.lower() not in fake.e
+    assert fake.e[solo.lower()][1]["member"] == [BASE.encode()]
+
+
+def test_delete_on_a_server_without_the_assertion_control(env):
+    mgr, fake = env
+    alice, solo = _alice_in_a_group(fake)
+    fake.assertion_supported = False
+    assert mgr.delete_entity(alice)["status"] == "SUCCESS"
+    assert alice.lower() not in fake.e
+    assert fake.e[solo.lower()][1]["member"] == [BASE.encode()]
+
+
+def test_no_assertion_control_still_spares_a_same_dn_replacement(env):
+    """Without the control, the identity is re-checked before the plain
+    delete: a replacement at the DN is neither deleted nor given the old
+    memberships."""
+    mgr, fake = env
+    alice, solo = _alice_in_a_group(fake)
+    fake.assertion_supported = False
+    real_delete = fake.delete_ext_s
+
+    def _replaced_first(dn, serverctrls=None):
+        fake.e[dn.lower()][1]["entryUUID"] = [b"uuid-new"]
+        real_delete(dn, serverctrls)
+    fake.delete_ext_s = _replaced_first
+    assert mgr.delete_entity(alice)["status"] == "SUCCESS"
+    assert fake.e[alice.lower()][1]["entryUUID"] == [b"uuid-new"]
+    assert fake.e[solo.lower()][1]["member"] == [BASE.encode()]
+
+
+def test_an_entry_without_any_identity_is_deleted_by_dn(env):
+    mgr, fake = env
+    alice, solo = _alice_in_a_group(fake)
+    del fake.e[alice.lower()][1]["entryUUID"]
+    assert mgr.delete_entity(alice)["status"] == "SUCCESS"
+    assert alice.lower() not in fake.e
+    assert fake.e[solo.lower()][1]["member"] == [BASE.encode()]
+
+
+def test_a_refused_delete_without_identity_restores_by_dn(env):
+    mgr, fake = env
+    alice, solo = _alice_in_a_group(fake)
+    del fake.e[alice.lower()][1]["entryUUID"]
+
+    def _refuse(dn):
+        raise fake.ldap.LDAPError("insufficient access")
+    fake.delete_s = _refuse
+    assert mgr.delete_entity(alice)["status"] == "ERROR"
+    assert fake.e[solo.lower()][1]["member"] == [alice.encode()]

@@ -55,6 +55,9 @@ REPO_URL="https://github.com/lbockenstedt/ldap.git"
 INSTALL_DIR="/opt/lm"
 OLD_INSTALL_DIR="/opt/lm-manager"
 TLS_DIR="/etc/ldap/tls"
+SLAPD_DEFAULTS="/etc/default/slapd"          # slapd's listeners (SLAPD_SERVICES)
+ACLS_PENDING="/etc/ldap/.lm-acls-pending"    # set until a NEW server has its ACLs
+POLICY_RC_D="/usr/sbin/policy-rc.d"           # Debian's hook for package service starts
 SASL_SERVICE="slapd"      # slapd's Cyrus SASL app name → /etc/pam.d/<this>
 
 # ── Parse arguments ──────────────────────────────────────────────────────────
@@ -263,6 +266,91 @@ saslauthd_path: /var/run/saslauthd/mux"
     fi
 }
 
+# Replace the data database's olcAccess with tenant-scoped rules (see
+# src/ldif_template.py render_acl_ldif): no anonymous reads, no self-write of
+# userPassword, an entry readable only from inside its own top-level OU.
+configure_directory_acls() {
+    local acl
+    acl="$(./venv/bin/python3 -m src.ldif_template --acl "$BASE_DN")" \
+        || { echo "❌ cannot build the directory ACLs for base DN $BASE_DN." >&2; return 1; }
+    printf '%s\n' "$acl" | apply_config_ldif \
+        || { echo "❌ applying the directory ACLs failed." >&2; return 1; }
+    echo "🔒 Directory ACLs applied (tenant-scoped reads, no anonymous reads)."
+}
+
+# set_slapd_services LIST: set SLAPD_SERVICES (slapd's listeners) in
+# $SLAPD_DEFAULTS, keeping the file's other lines. Takes effect on the next
+# slapd (re)start.
+set_slapd_services() {
+    local rest
+    rest="$(grep -v '^SLAPD_SERVICES=' "$SLAPD_DEFAULTS" 2>/dev/null || true)"
+    printf '%s\nSLAPD_SERVICES="%s"\n' "$rest" "$1" > "$SLAPD_DEFAULTS"
+}
+
+# hold_slapd_start: stop apt's postinst from starting slapd, via Debian's
+# policy-rc.d hook (honoured by invoke-rc.d, which passes "slapd", and by
+# deb-systemd-invoke, which passes "slapd.service"; exit 101 = not allowed). Without it the postinst starts slapd on its default
+# network listeners, and a removed-but-not-purged slapd starts its old
+# database with its old open ACLs. Only slapd is held, and an existing
+# policy-rc.d (a container's, say) is left alone, with a warning.
+hold_slapd_start() {
+    if [ -e "$POLICY_RC_D" ] && ! grep -q 'lm-ldap-hold' "$POLICY_RC_D" 2>/dev/null; then
+        echo "⚠️  $POLICY_RC_D exists; chaining slapd start hold." >&2
+        cp -a "$POLICY_RC_D" "${POLICY_RC_D}.lm-orig" || return 1
+    fi
+    printf '#!/bin/sh\n# lm-ldap-hold: install_ldap.sh removes this after apt.\ncase "$1" in slapd|slapd.service) exit 101 ;; esac\n' \
+        > "$POLICY_RC_D" || return 1
+    if [ -f "${POLICY_RC_D}.lm-orig" ]; then
+        printf 'exec "%s.lm-orig" "$@"\n' "$POLICY_RC_D" >> "$POLICY_RC_D"
+    else
+        printf 'exit 0\n' >> "$POLICY_RC_D"
+    fi
+    chmod 0755 "$POLICY_RC_D"
+}
+
+# release_slapd_start: remove our policy-rc.d hold (never someone else's).
+release_slapd_start() {
+    grep -q 'lm-ldap-hold' "$POLICY_RC_D" 2>/dev/null || return 0
+    if [ -f "${POLICY_RC_D}.lm-orig" ]; then
+        mv -f "${POLICY_RC_D}.lm-orig" "$POLICY_RC_D"
+    else
+        rm -f "$POLICY_RC_D"
+    fi
+}
+
+# While $ACLS_PENDING exists (a NEW server whose tenant-scoped ACLs are not
+# applied yet), slapd listens only on its local ldapi:/// socket, so no
+# network client ever reads Debian's open default ("to * by * read"). The
+# setting is in slapd's own config file, so it survives a failed or killed
+# installer run and a reboot; open_directory_after_acls lifts it.
+restrict_slapd_to_ldapi() {
+    set_slapd_services "ldapi:///" && systemctl restart slapd >/dev/null 2>&1 && return 0
+    echo "❌ could not restart slapd on ldapi:/// only; stopping it." >&2
+    systemctl stop slapd >/dev/null 2>&1 \
+        || echo "⚠️  could not stop slapd either: check that it is not listening on the network." >&2
+    return 1
+}
+
+# Step 5b of provision_server: the tenant-scoped ACLs, then (for a new
+# server) its network listeners. On failure a new server stays on ldapi:///
+# only, and an existing server (no marker) keeps its previous ACLs: stopping
+# it would take every tenant's logins down. Either way the install fails and
+# a re-run applies the ACLs once the cause is fixed.
+open_directory_after_acls() {
+    if ! configure_directory_acls; then
+        if [ -e "$ACLS_PENDING" ]; then
+            echo "❌ slapd stays on ldapi:/// only (no network listener) until a re-run applies the ACLs." >&2
+        else
+            echo "❌ slapd keeps its previous ACLs; fix the error above and re-run the installer." >&2
+        fi
+        return 1
+    fi
+    [ -e "$ACLS_PENDING" ] || return 0
+    set_slapd_services "ldap:/// ldapi:///" && rm -f "$ACLS_PENDING" && return 0
+    echo "❌ could not restore slapd's network listeners in $SLAPD_DEFAULTS; re-run the installer." >&2
+    return 1
+}
+
 provision_server() {
     [ -z "$BASE_DN" ]  && BASE_DN="$(derive_base_dn)"
     [ -z "$ADMIN_DN" ] && ADMIN_DN="cn=admin,$BASE_DN"
@@ -296,13 +384,40 @@ slapd slapd/allow_ldap_v2 boolean false
 slapd slapd/no_configuration boolean false
 DEBCONF
 
+    # A NEW server is marked ACL-pending before slapd is installed, so a run
+    # that dies anywhere before step 5b (or a retry, which finds slapd
+    # installed) still keeps it off the network. An existing marker is kept.
+    # Its package scripts must not start slapd either (hold_slapd_start).
+    if ! dpkg-query -W -f='${Status}' slapd 2>/dev/null | grep -q 'install ok installed'; then
+        mkdir -p "$(dirname "$ACLS_PENDING")" && touch "$ACLS_PENDING" \
+            || { echo "❌ cannot create $ACLS_PENDING." >&2; exit 1; }
+    fi
+    if [ -e "$ACLS_PENDING" ]; then
+        hold_slapd_start || { echo "❌ cannot write $POLICY_RC_D." >&2; exit 1; }
+    fi
+
     # 2. Install slapd + ALL prereqs (sasl2-bin/libsasl2-modules for the Entra
     #    pass-through, openssl for the self-signed TLS cert, python for the
     #    renderers + ROPC bridge, ldap-utils for ldapmodify/ldapadd).
-    DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    # If apt fails, a pending server that got as far as slapd's config file
+    # is set to ldapi:/// only, so a reboot can't start it on the network;
+    # the hold stays until a re-run.
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y \
         slapd ldap-utils sasl2-bin libsasl2-modules libsasl2-modules-ldap \
         openssl git python3-pip python3-venv jq curl \
-        libldap2-dev libsasl2-dev
+        libldap2-dev libsasl2-dev; then
+        if [ -e "$ACLS_PENDING" ] && [ -e "$SLAPD_DEFAULTS" ]; then
+            set_slapd_services "ldapi:///" || true
+        fi
+        echo "❌ apt-get install failed; re-run the installer." >&2
+        exit 1
+    fi
+    # slapd has not started (held) unless another policy-rc.d allowed it;
+    # either way it now starts on ldapi:/// only.
+    if [ -e "$ACLS_PENDING" ]; then
+        release_slapd_start || { echo "❌ cannot remove $POLICY_RC_D." >&2; exit 1; }
+        restrict_slapd_to_ldapi || exit 1
+    fi
     systemctl enable slapd >/dev/null 2>&1 || true
     systemctl start slapd >/dev/null 2>&1 || true
     sleep 1
@@ -347,6 +462,10 @@ LDIF
         echo "⚠️  base structure apply reported: $out"
     fi
     rm -f "$TMPLDIF" "$PWFILE"
+
+    # 5b. Tenant-scoped ACLs in place of Debian's open default; a new server
+    #     gets its network listeners at the restart below.
+    open_directory_after_acls || exit 1
 
     # 6. Self-signed TLS so LDAPS works before the hub brokers a real cert
     #    (INSTALL_CERT later overwrites these same paths).
@@ -403,11 +522,7 @@ replace: olcTLSCertificateKeyFile
 olcTLSCertificateKeyFile: $TLS_DIR/slapd-key.pem
 LDIF
         # Enable the ldaps:// listener (idempotent).
-        if grep -q '^SLAPD_SERVICES=' /etc/default/slapd 2>/dev/null; then
-            sed -i 's|^SLAPD_SERVICES=.*|SLAPD_SERVICES="ldap:/// ldapi:/// ldaps:///"|' /etc/default/slapd
-        else
-            echo 'SLAPD_SERVICES="ldap:/// ldapi:/// ldaps:///"' >> /etc/default/slapd
-        fi
+        set_slapd_services "ldap:/// ldapi:/// ldaps:///"
     fi
 }
 
