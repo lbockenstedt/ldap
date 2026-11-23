@@ -295,17 +295,27 @@ set_slapd_services() {
 # policy-rc.d (a container's, say) is left alone, with a warning.
 hold_slapd_start() {
     if [ -e "$POLICY_RC_D" ] && ! grep -q 'lm-ldap-hold' "$POLICY_RC_D" 2>/dev/null; then
-        echo "⚠️  $POLICY_RC_D exists; not adding the slapd start hold." >&2
-        return 0
+        echo "⚠️  $POLICY_RC_D exists; chaining slapd start hold." >&2
+        cp -a "$POLICY_RC_D" "${POLICY_RC_D}.lm-orig" || return 1
     fi
-    printf '#!/bin/sh\n# lm-ldap-hold: install_ldap.sh removes this after apt.\ncase "$1" in slapd|slapd.service) exit 101 ;; esac\nexit 0\n' \
-        > "$POLICY_RC_D" && chmod 0755 "$POLICY_RC_D"
+    printf '#!/bin/sh\n# lm-ldap-hold: install_ldap.sh removes this after apt.\ncase "$1" in slapd|slapd.service) exit 101 ;; esac\n' \
+        > "$POLICY_RC_D" || return 1
+    if [ -f "${POLICY_RC_D}.lm-orig" ]; then
+        printf 'exec "%s.lm-orig" "$@"\n' "$POLICY_RC_D" >> "$POLICY_RC_D"
+    else
+        printf 'exit 0\n' >> "$POLICY_RC_D"
+    fi
+    chmod 0755 "$POLICY_RC_D"
 }
 
 # release_slapd_start: remove our policy-rc.d hold (never someone else's).
 release_slapd_start() {
     grep -q 'lm-ldap-hold' "$POLICY_RC_D" 2>/dev/null || return 0
-    rm -f "$POLICY_RC_D"
+    if [ -f "${POLICY_RC_D}.lm-orig" ]; then
+        mv -f "${POLICY_RC_D}.lm-orig" "$POLICY_RC_D"
+    else
+        rm -f "$POLICY_RC_D"
+    fi
 }
 
 # While $ACLS_PENDING exists (a NEW server whose tenant-scoped ACLs are not
