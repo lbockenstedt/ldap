@@ -79,7 +79,30 @@ example `<session folder>/files/review/<repo>`).
 
        copilot -p "<reviewer prompt>" --model <model> -s --add-dir <dir> \
            --allow-tool view --allow-tool grep --allow-tool glob \
+           --usage-output-file <dir>/<panel>-<model>-<round>.usage.json \
            > <dir>/<panel>-<model>.out
+
+   The usage file holds the run's cost. Record every run in the model ledger
+   (the `model-ledger` skill), retries and runs with no verdict included,
+   passing that file so the cost of every review, and of every miss, is
+   known:
+
+       python3 <fleet>/lm/.claude/skills/model-ledger/localstat.py outcome \
+           --agent reviewer --model <model> --task review --repo <repo> \
+           --usage-file <dir>/<panel>-<model>-<round>.usage.json \
+           --result pass|fail [--reason ...] --note "<panel>: <verdict>, <why>"
+
+   The result is whether the verdict was right, not whether it found
+   something:
+   - `pass`: a Reject whose finding blocks under fleet rule 1.9, or an
+     Approve that held up (the frontier reviewer did not overturn it on a
+     blocking finding).
+   - `fail --reason wrong_answer`: a Reject only on a follow-up (rule 1.9:
+     not a reason to Reject), a Reject on a claim the code disproves, or an
+     Approve the frontier reviewer then rejected on a blocking finding.
+     Record a cheap reviewer's run once the frontier verdict is in.
+   - `fail --reason crash` (or `timeout` when it hit the time limit): a run
+     with no verdict. It still cost money, so it is still recorded.
 
    The reviewer gets read-only tools and no shell: it reads and greps the
    code but does not run it. The tests are smoke.sh's job (fleet rule 1.5),
@@ -102,15 +125,35 @@ example `<session folder>/files/review/<repo>`).
      (`fix_engine.panel_verdict`) and so expects every seat's vote; it is
      not used with the ladder.
 5. Read every `Reject` critique, and the critique of every `Approve` (it
-   can carry findings). Once both panels pass, fix only
-   real defects; record non-blocking notes as follow-ups for the user rather
+   can carry findings). Fix only real defects, whether the panel rejected
+   or approved; record non-blocking notes as follow-ups for the user rather
    than editing for them (fleet rule 1.9 says which findings block). For
-   each `Reject` that is right:
+   each real defect, in a `Reject` or in an `Approve`'s critique:
    - Fix the whole class of defect in one pass, not just the line cited
      (fleet rule 1.9): grep every call site in the change and its twins,
      write the state matrix, and fix every cell. A fix that needs a new
      mechanism gets a design review first.
+   - The coder ladder writes the fix. The coordinator writes it only when
+     it is 5 lines or fewer, when it is in design, security, auth, tenant
+     or credential code (as for any coding task), or when
+     `cloud-coder-plus` has already failed on the same finding (the
+     ladder's last rung). Give the coding agent
+     the critique, the state matrix, the files and the test command. Start
+     at `cloud-coder-plus` when it wrote the change, else at `cloud-coder`
+     (a change written by the coordinator, a person, a local agent or
+     `cloud-coder`). Climb one rung when the next review raises the same
+     finding again.
    - Add a test that fails without the fix.
+   - A fix that fails the tests or smoke is recorded at once as `--task
+     fix --result fail` (`corrupt_code`) and goes one rung up; it never
+     reaches the review.
+   - Otherwise record the fix round in the model ledger once the next
+     review is in:
+     `--task fix`, the model that wrote the fix, `--result pass` if that
+     review no longer raises the finding and finds no new defect in the
+     fix, else `fail` (`incomplete` when the same finding returns,
+     `wrong_answer` when the fix is wrong or brings in a new defect). This
+     shows which models can fix from reviewer feedback, and at what cost.
    - Amend the commit, then go back to step 2.
    - If a reject is wrong, add the evidence to the commit message or a code
      comment rather than ignoring it. AB's reviewers will raise it too.
